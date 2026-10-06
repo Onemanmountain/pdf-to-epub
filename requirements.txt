@@ -1,0 +1,14 @@
+# epub_verify.py 运行依赖（装入 mineru 同一个 venv）
+pymupdf>=1.24
+Pillow>=10
+
+# ---- transformers 后端另需（ollama 后端不需要）----
+# torch>=2.5            # 按你的 CUDA 版本从 pytorch.org 选装
+# transformers>=4.53    # 需含 pp_doclayout_v2（MinerU 版式模型依赖）
+# bitsandbytes>=0.45    # 4bit 量化
+# accelerate>=1.0
+# qwen-vl-utils>=0.0.14
+# timm>=1.0             # DETR 类版式模型依赖
+
+# MinerU 本体请单独安装（依赖较重，见其官方文档）：
+#   pip install mineru[core]==4.0.10

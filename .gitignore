@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 模型权重（体积大，自行下载）
+models/
+*.gguf
+*.safetensors
+
+# 版权红线：任何书籍内容与转换产物一律不进仓库
+*.pdf
+*.epub
+*.zip
+epub_out/
+extracted/
+*-fixed.md
+*-fixed.md.bak
+verify_report*.json
+mineru_*/
