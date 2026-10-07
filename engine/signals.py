@@ -45,7 +45,7 @@ def aggregate_signals(descs, book_title=None):
             "name": "引子段即篇界",
             "description": f"抽样见 {len(bios)} 处作者生平式段落（姓名+生卒/籍贯+著有《》），其后紧跟新篇篇名与署名",
             "target": "text_blocks",
-            "match": {"regex": r"^[一-龥]{2,4}(（\d{4}[—–-]\d{0,4}）|[12]\d{3}年生|，原名)"},
+            "match": {"regex": r"^[一-龥]{2,4}\s*(（\d{4}[—–-]\d{0,4}）|[12]\d{3}年生|，原名)"},  # \s*：实测引子段存在"姓名 空格 年份"变体（验证脚本逮到）
             "signals_boundary": "article",
             "confidence": min(0.9, 0.5 + 0.15 * len(bios)),
             "evidence_pages": bios[:8]})
