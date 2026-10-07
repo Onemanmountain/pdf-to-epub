@@ -1,28 +1,37 @@
-﻿# pdf-to-epub.ps1 — v0.2.0 引擎驱动版
-# 扫描版 PDF → 可重排 EPUB：一条命令走完 Phase 0-4（引擎在 engine.pipeline）
-# 本脚本只负责：交互询问、ollama 起床检查、调用引擎。转换逻辑全在引擎仓。
-#
-# 用法:
-#   .\pdf-to-epub.ps1                 # 交互模式：逐项询问
-#   .\pdf-to-epub.ps1 -Pdf book.pdf -Title 书名 -Author 某人 -Mode auto
-#   .\pdf-to-epub.ps1 -Help           # 显示本帮助
-#
-# 参数:
-#   -Pdf        PDF 路径（可省略进入交互；支持拖拽带引号路径）
-#   -OutDir     工作输出目录（默认 <PDF旁>\epub_out；zip/profile 自动复用）
-#   -Title      书名（默认取 PDF 文件名）
-#   -Author     作者（可空）
-#   -Mode       auto=批量智能（默认，零干预）| guided=主动审阅（校验后暂停等人）
-#   -SkipScout  跳过 Phase 0 侦察（无结构规则，退回 MinerU 原生标题）
-#   -EngineDir  引擎仓目录（默认 D:\Documents\pdf-to-epub，或环境变量 PDF2EPUB_ENGINE）
-#   -VenvDir    mineru venv 目录，默认 $env:MINERU_VENV 或 ~\mineru-venv
-#   -OllamaExe  ollama.exe 路径，默认查 PATH 再查 %LOCALAPPDATA%\Programs\Ollama
-#   -Proxy      仅用于 ollama pull 补拉模型；默认空=不设置
-#
-# 双模式说明:
-#   auto   批量智能：仲裁/裁决全自动，不一致项 do-no-harm 保持原文并记报告
-#   guided 主动审阅：校验后打印报告路径并暂停，人工改 md 后回车继续封装
-# 前提: ollama 模型 qwen3:8b + qwen2.5vl:7b（缺了自动补拉）；pandoc 在 PATH
+﻿<#
+.SYNOPSIS
+  pdf-to-epub v0.2.0 引擎驱动版 —— 扫描版 PDF → 可重排 EPUB，一条命令走完 Phase 0-4
+.DESCRIPTION
+  本脚本只负责：交互询问、ollama 起床检查、调用引擎（engine.pipeline）。转换逻辑全在引擎仓。
+
+  双模式:
+    auto   批量智能（默认，零人工干预）：仲裁/裁决全自动，不一致项 do-no-harm 保持原文并记报告
+    guided 主动审阅：校验后打印报告路径并暂停，人工改 md 后回车继续封装
+.PARAMETER Pdf
+  PDF 路径（可省略进入交互；支持拖拽带引号路径）
+.PARAMETER OutDir
+  工作输出目录（默认 <PDF旁>\epub_out；zip/profile 自动复用）
+.PARAMETER Title
+  书名（默认取 PDF 文件名）
+.PARAMETER Author
+  作者（可空）
+.PARAMETER Mode
+  auto=批量智能（默认）| guided=主动审阅
+.PARAMETER SkipScout
+  跳过 Phase 0 侦察（无结构规则，退回 MinerU 原生标题）
+.PARAMETER EngineDir
+  引擎仓目录（默认 D:\Documents\pdf-to-epub，或环境变量 PDF2EPUB_ENGINE）
+.PARAMETER VenvDir
+  mineru venv 目录，默认 $env:MINERU_VENV 或 ~\mineru-venv
+.PARAMETER OllamaExe
+  ollama.exe 路径，默认查 PATH 再查 %LOCALAPPDATA%\Programs\Ollama
+.PARAMETER Proxy
+  仅用于 ollama pull 补拉模型；默认空=不设置
+.EXAMPLE
+  .\pdf-to-epub.ps1
+.EXAMPLE
+  .\pdf-to-epub.ps1 -Pdf book.pdf -Title 书名 -Author 某人 -Mode guided
+#>
 param(
   [switch]$Help,
   [string]$Pdf,
