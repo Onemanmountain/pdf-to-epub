@@ -1,3 +1,6 @@
+# 本地私有配置（凭证，绝不入库）
+config.local.yaml
+
 # Python
 __pycache__/
 *.pyc

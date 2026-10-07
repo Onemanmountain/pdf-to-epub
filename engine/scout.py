@@ -149,6 +149,54 @@ SYNTH_PROMPT = """你在为「扫描PDF→EPUB」转换流水线做结构侦察�
 
 # ---------------- 主流程 ----------------
 
+ARB_RULES_PROMPT = """你是「扫描PDF→EPUB」流水线的结构规则仲裁员。视觉模型已对抽样页完成阅读，系统从描述中确定性聚合出候选结构规则。你的任务：审核候选，并可补充。
+
+【候选规则】
+{candidates}
+
+【抽样页描述（idx 为 0 起页码）】
+{descs}
+
+要求：
+1. 对每条候选给 verdict：adopt / reject / adjust（调整须给出修正后的完整规则 JSON）
+2. 可补充候选遗漏的强规律（added）：必须有 evidence_pages，且规律在描述中出现 ≥2 次；单页强证据可放宽但 reason 里必须说明
+3. 可执行字段约束：target ∈ header_blocks|text_blocks|title_blocks；match 可含 block_type / regex / max_len / exclude_text
+4. 只输出 JSON：
+{{"verdicts": [{{"name": "...", "verdict": "adopt|reject|adjust", "rule": <完整规则或null>, "reason": "..."}}],
+ "added": [<完整规则>...],
+ "notes": "一句话总评"}}"""
+
+
+def arbitrate_rules(descs, candidates, backend):
+    """外部强模型仲裁候选规则。返回 (final_rules, verdicts_raw)。
+    仲裁失败/输出不可解析 → 原样返回候选（聚合层是兜底证据层）。"""
+    prompt = ARB_RULES_PROMPT.format(
+        candidates=json.dumps(candidates, ensure_ascii=False, indent=1),
+        descs=json.dumps(descs, ensure_ascii=False, indent=1))
+    try:
+        raw = backend.reason(prompt)
+        v = extract_json(raw)
+    except Exception as e:
+        return candidates, {"_error": str(e)[:200]}
+    if not v or "verdicts" not in v:
+        return candidates, {"_unparsed": (raw or "")[:300]}
+    orig = {r["name"]: r for r in candidates}
+    final = []
+    for vd in v["verdicts"]:
+        name, verdict = vd.get("name"), vd.get("verdict")
+        if verdict == "adopt" and name in orig:
+            final.append(orig[name])
+        elif verdict == "adjust" and isinstance(vd.get("rule"), dict) and vd["rule"].get("target"):
+            final.append(vd["rule"])
+        # reject → 丢弃
+    for r in v.get("added", []):
+        if isinstance(r, dict) and r.get("target") and r.get("name"):
+            r["confidence"] = min(float(r.get("confidence", 0.7)), 0.85)
+            r["_source"] = "llm-arb"
+            final.append(r)
+    return final, v
+
+
 def extract_json(text):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
@@ -159,7 +207,7 @@ def extract_json(text):
         return None
 
 
-def scout(pdf_path, out_path, backend, dpi=150, n_samples=16, llm_synth=False):
+def scout(pdf_path, out_path, backend, dpi=150, n_samples=16, llm_synth=False, arb_backend=None):
     tmp = tempfile.mkdtemp(prefix="scout_")
     doc = pymupdf.open(pdf_path)
     total = doc.page_count
@@ -192,6 +240,12 @@ def scout(pdf_path, out_path, backend, dpi=150, n_samples=16, llm_synth=False):
     print("[scout] 确定性信号聚合（证据驱动，替代 LLM 自由立法）...")
     from . import signals
     profile = signals.build_profile(descs, total)
+    if arb_backend is not None and profile["boundary_rules"]:
+        print("[scout] 外部强模型仲裁候选规则...")
+        final_rules, verdicts = arbitrate_rules(descs, profile["boundary_rules"], arb_backend)
+        profile["boundary_rules"] = final_rules
+        profile["arbitration"] = verdicts
+        print(f"[scout] 仲裁后规则 {len(final_rules)} 条: {[r['name'] for r in final_rules]}")
     if llm_synth:
         # 可选：LLM 仲裁层（默认关闭——实测 8B 自由立法会内容过拟合）
         syn = backend.reason(SYNTH_PROMPT.format(total=total, descs=json.dumps(descs, ensure_ascii=False, indent=1)))
@@ -218,11 +272,19 @@ def main():
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--samples", type=int, default=16)
     ap.add_argument("--config", default=None)
-    ap.add_argument("--llm-synth", action="store_true", help="额外让 LLM 对聚合结果做仲裁注释（默认关闭）")
+    ap.add_argument("--llm-synth", action="store_true", help="额外让本地 LLM 做注释（默认关闭）")
+    ap.add_argument("--arbitrate", action="store_true", help="用 config 里的 api 后端仲裁候选规则")
     args = ap.parse_args()
     cfg = load_config(args.config)
     backend = make_backend(cfg)
-    scout(args.pdf, args.out, backend, dpi=args.dpi, n_samples=args.samples, llm_synth=args.llm_synth)
+    arb = None
+    if args.arbitrate:
+        s = cfg["scout"]
+        if not (s["api_base"] and s["api_key"] and s["api_model"]):
+            raise SystemExit("[X] --arbitrate 需要 config.local.yaml 配齐 api_base/api_key/api_model")
+        arb = ExternalAPI(s["api_base"], s["api_key"], s["api_model"])
+    scout(args.pdf, args.out, backend, dpi=args.dpi, n_samples=args.samples,
+          llm_synth=args.llm_synth, arb_backend=arb)
 
 
 if __name__ == "__main__":
