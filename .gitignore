@@ -20,3 +20,4 @@ extracted/
 *-fixed.md.bak
 verify_report*.json
 mineru_*/
+runs/
