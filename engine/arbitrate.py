@@ -88,7 +88,13 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
             j = {"supports": "none", "reason": f"error {e}"}
         sup = j.get("supports", "none")
         jc = (judge or "").strip()
-        if sup == "C" and jc and norm(jc) != norm(old) and md.count(old) == 1:
+        if sup == "C" and jc and norm(jc) != norm(old) and len(jc) < 0.8 * len(old):
+            # 收缩护栏：纠正把文本砍掉 20%+ → 是"转录不全"不是"改错"，拒落地
+            # （长段落天然过唯一性检查，曾致 3 处整段被截断替换——《漫长的革命》实测事故）
+            unresolved.append({**it, "arb_actual": j.get("actual", ""), "arb_supports": sup,
+                               "note": f"收缩 {len(old)}→{len(jc)} 超20%拒落地"})
+            mark = "保持原文(收缩护栏)"
+        elif sup == "C" and jc and norm(jc) != norm(old) and md.count(old) == 1:
             md = md.replace(old, jc, 1)
             applied.append({"page": page, "old": old, "new": jc, "actual": j.get("actual", "")})
             mark = "✓落地"

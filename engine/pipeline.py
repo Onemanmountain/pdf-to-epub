@@ -40,7 +40,7 @@ def unique_path(path):
     return f"{stem}-{n}{ext}"
 
 
-def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False):
+def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no_arbitrate=False):
     from . import config, scout, structure, arbitrate, qc
     cfg = config.load_config(config_path)
     os.makedirs(outdir, exist_ok=True)
@@ -53,18 +53,41 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False):
 
     # ---- Phase 0: scout ----
     profile_p = os.path.join(outdir, "book_profile.json")
-    if skip_scout or os.path.exists(profile_p):
-        print(f"[Phase 0] 复用已有 profile: {profile_p}" if os.path.exists(profile_p) else "[Phase 0] 跳过 scout")
+    profile_ok = os.path.exists(profile_p)
+    if profile_ok:  # 复用前校验归属：profile 必须属于本 PDF，防多书共用 outdir 串味
+        try:
+            _p = json.load(open(profile_p, encoding="utf-8"))
+            profile_ok = _p.get("_meta", {}).get("pdf") == os.path.basename(pdf)
+        except Exception:
+            profile_ok = False
+    if skip_scout or profile_ok:
+        print(f"[Phase 0] 复用已有 profile: {profile_p}" if profile_ok else "[Phase 0] 跳过 scout")
         if not os.path.exists(profile_p):
             json.dump({"boundary_rules": []}, open(profile_p, "w", encoding="utf-8"))
     else:
         print("[Phase 0] Scout 侦察中（抽样视觉阅读）...")
         scout.scout(pdf, profile_p, scout.make_backend(cfg))
     profile = json.load(open(profile_p, encoding="utf-8"))
+    # 仲裁层（默认开，凭证在位即启用；profile 复用时同样执行）：
+    # 聚合层也会过拟合（如把正文里的名人生平段误判为篇界），外部仲裁是设计内的刹车
+    if not no_arbitrate and profile.get("_descs") and not profile.get("arbitration"):
+        s = cfg["scout"]
+        if s["api_base"] and s["api_key"] and s["api_model"]:
+            print("[Phase 0+] 外部强模型仲裁候选规则...")
+            arb = scout.ExternalAPI(s["api_base"], s["api_key"], s["api_model"])
+            final_rules, verdicts = scout.arbitrate_rules(profile["_descs"],
+                                                          profile.get("boundary_rules", []), arb)
+            profile["boundary_rules"] = final_rules
+            profile["arbitration"] = verdicts
+            json.dump(profile, open(profile_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            print(f"[Phase 0+] 仲裁后规则 {len(final_rules)} 条: {[r['name'] for r in final_rules]}")
     report["phases"]["scout"] = {"rules": [r["name"] for r in profile.get("boundary_rules", [])]}
 
     # ---- Phase 1: mineru ----
-    zips = [f for f in os.listdir(outdir) if f.endswith(".zip")]
+    pdf_stem = os.path.splitext(os.path.basename(pdf))[0]
+    # 只复用名字与本书匹配的 zip（防多书共用 outdir 时错配他书解析产物）
+    zips = [f for f in os.listdir(outdir) if f.endswith(".zip")
+            and (os.path.splitext(f)[0] in (pdf_stem, title) or pdf_stem in os.path.splitext(f)[0])]
     if zips:
         zip_p = os.path.join(outdir, sorted(zips, key=lambda f: -os.path.getmtime(os.path.join(outdir, f)))[0])
         print(f"[Phase 1] 复用解析产物: {zip_p}")
@@ -72,7 +95,13 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False):
         print("[Phase 1] MinerU 解析中（GPU，耐心）...")
         sh([mineru, "parse", pdf, "-o", outdir, "-f", "zip", "--tier", "standard"],
            env_extra={"MINERU_MODEL_SOURCE": "modelscope"})
-        zips = [f for f in os.listdir(outdir) if f.endswith(".zip")]
+        zips = [f for f in os.listdir(outdir) if f.endswith(".zip")
+                and (os.path.splitext(f)[0] in (pdf_stem, title) or pdf_stem in os.path.splitext(f)[0])]
+        if not zips:  # mineru 产物名不含书名时退回最新 zip
+            zips = sorted((f for f in os.listdir(outdir) if f.endswith(".zip")),
+                          key=lambda f: -os.path.getmtime(os.path.join(outdir, f)))
+        if not zips:
+            raise SystemExit("[X] MinerU 解析后未找到产物 zip（解析可能失败）")
         zip_p = os.path.join(outdir, zips[0])
     extracted = os.path.join(outdir, "extracted")
     if not os.path.exists(extracted):
@@ -156,10 +185,11 @@ def main():
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--mode", choices=["auto", "guided"], default="auto")
     ap.add_argument("--skip-scout", action="store_true")
+    ap.add_argument("--no-arbitrate", action="store_true", help="关闭外部仲裁层（默认开，需 config.local.yaml 凭证）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
     outdir = args.outdir or os.path.join(os.path.dirname(os.path.abspath(args.pdf)), "epub_out")
-    run(args.pdf, args.title, args.author, outdir, args.mode, args.config, args.skip_scout)
+    run(args.pdf, args.title, args.author, outdir, args.mode, args.config, args.skip_scout, args.no_arbitrate)
 
 
 if __name__ == "__main__":

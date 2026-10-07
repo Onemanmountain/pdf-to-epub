@@ -103,20 +103,33 @@ def _by_headers(pages, rule, match, total):
 
 
 def _find_title_page(pages, header_page, title):
-    """从 header_page 回找：含 title 文本块（且无有效页眉）的页 = 篇名页。"""
-    for p in range(header_page - 1, max(-1, header_page - 4), -1):
+    """从 header_page 回找：含 title 文本块（且无有效页眉）的页 = 篇名页。
+    匹配分两级：①规范化全等（单块篇名）②包含匹配（「第X编 标题」式组合页眉——
+    编名页上编序与标题常是两个独立块，页眉是其拼接，全等会静默漏检）。"""
+    nt = norm(title)
+    for p in range(header_page - 1, max(-1, header_page - 7), -1):  # 回看 6 页：编名页后可能有空白页+无页眉章首页
         if p not in pages:
             continue
         texts = [b["text"] for b in pages[p] if b["type"] in ("text", "paragraph_title", "doc_title")]
+        hit = -1
         for i, t in enumerate(texts):
-            if norm(t) == norm(title):
-                author = ""
-                # 篇名块之后的短块（≤4 字）视为署名
-                for t2 in texts[i + 1: i + 3]:
-                    if 0 < len(t2) <= 4 and re.fullmatch(r"[一-龥·]{2,4}", t2):
-                        author = t2
-                        break
-                return p, title, author
+            n = norm(t)
+            if n == nt:  # 全等优先
+                hit = i
+                break
+        if hit < 0:
+            for i, t in enumerate(texts):
+                n = norm(t)
+                if len(n) >= 2 and (n in nt or nt in n):  # 组合页眉的部分匹配
+                    hit = i
+                    break
+        if hit >= 0:
+            author = ""
+            for t2 in texts[hit + 1: hit + 3]:
+                if 0 < len(t2) <= 4 and re.fullmatch(r"[一-龥·]{2,4}", t2):
+                    author = t2
+                    break
+            return p, title, author
     return None, title, ""
 
 
@@ -170,9 +183,11 @@ def apply_to_markdown(md_text, boundaries, front_matter_last_page=None, pages_to
         title = b["title"]
         if not title:
             continue
+        nt = norm(title)
         found = -1
-        for i in range(cursor, min(len(lines), cursor + 200)):
-            if norm(lines[i].lstrip("#").strip()) == norm(title):
+        for i in range(cursor, len(lines)):  # 游标单调向前不设行窗：编距可能远超固定窗口（实测 30+ 页/编 → 数百行）
+            nl = norm(lines[i].lstrip("#").strip())
+            if nl == nt or (len(nl) >= 2 and nl in nt):  # 全等或「编序」行部分匹配（组合篇名跨行）
                 found = i
                 break
         if found >= 0:
