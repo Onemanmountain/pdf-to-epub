@@ -164,13 +164,24 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     fn_report = {}
     fn_md = footnotes.normalize_footnotes(pages, open(final_md, encoding="utf-8").read(), fn_report)
     fn_info = fn_report.get("footnotes", {})
+    epub_md_p = final_md.replace("-final.md", "-epub.md")
     if fn_info.get("converted", 0) > 0:
-        epub_md_p = final_md.replace("-final.md", "-epub.md")
         open(epub_md_p, "w", encoding="utf-8", newline="\n").write(fn_md)
         pandoc_src = epub_md_p
     else:
         pandoc_src = final_md
     report["phases"]["footnotes"] = fn_info
+
+    # ---- Phase 3.7: 页眉剥离 + 中文重排（v0.3.1 修复二/五）----
+    print("[Phase 3.7] 页眉剥离 + 中文重排...")
+    pp_src_text = open(pandoc_src, encoding="utf-8").read()
+    md_pp, pp_rep = structure.postprocess(pp_src_text, pages)
+    open(epub_md_p, "w", encoding="utf-8", newline="\n").write(md_pp)
+    pandoc_src = epub_md_p
+    report["phases"]["postprocess"] = {"head_set": pp_rep["head_set"],
+                                       "heads_removed": len(pp_rep["heads_removed"]),
+                                       "reflow_joins": pp_rep["reflow_joins"]}
+    print(f"  页眉剥离 {len(pp_rep['heads_removed'])} 处（{pp_rep['head_set']}），重排并接 {pp_rep['reflow_joins']} 行")
 
     # ---- Phase 4: pandoc + QC ----
     pandoc = shutil.which("pandoc")

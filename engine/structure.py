@@ -207,6 +207,24 @@ def apply_to_markdown(md_text, boundaries, front_matter_last_page=None, pages_to
 # ---------------- 结构调和（v0.3.0：唯一章节树权威）----------------
 CHAPTER_RE = re.compile(r"^\d{1,2}[.、]\s*\S{2,30}$")
 
+# v0.3.1 修复六：序数形态家族。同族（"其N"/"第N"）被字体投票 ≥2 次 → 族合法化，
+# 此后整行同形态文本一律提升为标题（其一 不再因文本型块沉底）。
+ORD_FAMILIES = [("其", re.compile(r"^其[一二三四五六七八九十]{1,2}$")),
+                ("第", re.compile(r"^第[一二三四五六七八九十]{1,3}$"))]
+
+def legit_ordinal_families(pages):
+    from collections import Counter
+    votes = Counter()
+    for p in sorted(pages):
+        for b in pages[p]:
+            if b["type"] != "paragraph_title":
+                continue
+            t = re.sub(r"\s+", "", b["text"].strip())
+            for fam, pat in ORD_FAMILIES:
+                if pat.match(t):
+                    votes[fam] += 1
+    return {fam for fam, c in votes.items() if c >= 2}
+
 def aggregate_numbered_chapters(pages):
     """编号章题模式聚合：全书范围内 ^数字. 标题 型块出现 ≥3 次 → 模式成立，全部合法化为二级标题。
     证据驱动：不预设书有编号章；模式由数据自己说话。"""
@@ -220,22 +238,22 @@ def aggregate_numbered_chapters(pages):
     return set(cands.keys()) if len(cands) >= 3 else set()
 
 def toc_line_range(md_lines, boundaries, applied):
-    """目录区行范围：『目录』落位行 → 下一篇边界的落位行（落位行号来自 apply 记录，
-    不受幻影标题干扰——幻影标题冒充边界标题会截断按标题扫描的区间，实测教训）。"""
+    """目录区行范围：『目录』标题行 → 其后第一个落位边界行。
+    目录可以是边界（漫长），也可以只是字体投票标题（艺术：目录不在篇目序列里）——
+    两种证据都接受。终点取落位记录中最近的下一个（幻影标题不在落位记录里，天然免疫）。"""
     toc_norm = {norm(b["title"]) for b in boundaries if "目录" in b["title"]}
-    if not toc_norm:
-        return None
     start = None
     for i, ln in enumerate(md_lines):
-        if ln.lstrip().startswith("#") and norm(re.sub(r"^#+\s*", "", ln)) in toc_norm:
+        if not ln.lstrip().startswith("#"):
+            continue
+        nt = norm(re.sub(r"^#+\s*", "", ln))
+        if (toc_norm and nt in toc_norm) or (not toc_norm and "目录" in nt):
             start = i
             break
     if start is None:
         return None
-    toc_page = next(b["page"] for b in boundaries if "目录" in b["title"])
-    applied_line = {a["title"]: a["line"] for a in applied}
-    nxt = [b for b in boundaries if b["page"] > toc_page and b["title"] in applied_line]
-    end = applied_line[min(nxt, key=lambda b: b["page"])["title"]] if nxt else len(md_lines)
+    later = [a["line"] for a in applied if a["line"] > start]
+    end = min(later) if later else len(md_lines)
     return (start, end)
 
 def reconcile_headings(md_text, boundaries, pages, applied):
@@ -248,6 +266,7 @@ def reconcile_headings(md_text, boundaries, pages, applied):
     for a in applied:  # 同名篇允许：落位行号集合（单值映射会把同名篇的第一个落位误杀——实测教训）
         l1_line.setdefault(norm(a["title"]), set()).add(a["line"])
     justified_l2 = aggregate_numbered_chapters(pages)
+    legit_fams = legit_ordinal_families(pages)
     lines = md_text.split("\n")
     toc_range = toc_line_range(lines, boundaries, applied)
     if toc_range:
@@ -259,6 +278,15 @@ def reconcile_headings(md_text, boundaries, pages, applied):
     demoted, keptn = [], []
     for i, ln in enumerate(lines):
         if not ln.lstrip().startswith("#"):
+            # v0.3.1 修复六：序数形态提升——整行就是已合法化的序数形态（短行、非特殊行）
+            t = re.sub(r"\s+", "", ln.strip())
+            if (ln.strip() and len(t) <= 6
+                    and not ln.strip().startswith(("- ", "* ", "+ ", "[^", "!"))
+                    and not (toc_range and toc_range[0] <= i < toc_range[1])
+                    and any(pat.match(t) for fam, pat in ORD_FAMILIES if fam in legit_fams)):
+                lines[i] = "### " + ln.strip()
+                keptn.append({"line": i + 1, "title": ln.strip(), "level": 3,
+                              "reason": "序数形态家族合法化提升"})
             continue
         title = re.sub(r"^#+\s*", "", ln).strip()
         nt = norm(title)
@@ -281,7 +309,104 @@ def reconcile_headings(md_text, boundaries, pages, applied):
             lines[i] = "### " + title
             keptn.append({"line": i + 1, "title": title, "level": 3,
                           "reason": "仅字体投票：保留强调不入大纲"})
+    # v0.3.1 修复三：目录区条目统一为列表格式（MinerU 对跨页目录会给两种排版）
+    if toc_range:
+        for i in range(toc_range[0] + 1, toc_range[1]):
+            s = lines[i].strip()
+            if s and not s.startswith(("- ", "* ", "+ ", "#")):
+                lines[i] = "- " + s
     return "\n".join(lines), demoted, keptn
+
+# ---------------- Phase 3.7 后处理（v0.3.1 修复二/五：页眉剥离 + 中文重排）----------------
+def detect_running_heads(pages, min_pages=3):
+    """页眉检测（证据驱动）：同一字符串出现在 ≥min_pages 个不同页的首块或尾块 → 页眉。
+    返回 {norm串: 原始串}。"""
+    from collections import Counter
+    top, bot, raw = Counter(), Counter(), {}
+    for p in sorted(pages):
+        bl = [b for b in pages[p] if b["text"].strip()]
+        if not bl:
+            continue
+        for cnt, blk in ((top, bl[0]), (bot, bl[-1])):
+            key = norm(blk["text"])
+            cnt[key] += 1
+            raw.setdefault(key, blk["text"].strip())
+    return {k: raw[k] for k in set(top) | set(bot) if top[k] + bot[k] >= min_pages and len(k) >= 2}
+
+SENT_END = set("。！？!?:：;；…””’」》》）)]")
+_CJK = lambda ch: "\u4e00" <= ch <= "\u9fff"
+_SPECIAL = ("#", "- ", "* ", "+ ", "[^", "!", "<", "|")
+_FOOTMARK = re.compile(r"^[①-⑳]")
+
+def _plain(s):
+    return s and not s.startswith(_SPECIAL) and not _FOOTMARK.match(s)
+
+def reflow_paragraphs(md_text):
+    """中文重排：①段内视觉换行并接（CJK-CJK 无空格，含拉丁则空格）；
+    ②跨段碎段合并——前段结尾不是任何句末符号，则它是被页边界打断的同一段。
+    圈号行/标题/列表/图片/脚注定义一律不动。返回 (新md, 并接次数)。"""
+    lines = md_text.split("\n")
+    out, buf, joins = [], None, 0
+    def flush():
+        nonlocal buf
+        if buf is not None:
+            out.append(buf); buf = None
+    for ln in lines:
+        s = ln.strip()
+        if not _plain(s):
+            flush(); out.append(ln); continue
+        if buf is None:
+            buf = s
+        else:
+            joiner = "" if _CJK(buf[-1]) and _CJK(s[0]) else " "
+            buf += joiner + s; joins += 1
+    flush()
+    res = []
+    for ln in out:
+        s = ln.strip()
+        if res and _plain(s):
+            j = len(res) - 1
+            while j >= 0 and not res[j].strip():
+                j -= 1
+            if j >= 0 and _plain(res[j].strip()) and res[j].rstrip()[-1] not in SENT_END:
+                prev = res[j].rstrip()
+                joiner = "" if _CJK(prev[-1]) and _CJK(s[0]) else " "
+                res[j] = prev + joiner + s; joins += 1
+                del res[j + 1:]
+                continue
+        res.append(ln)
+    return "\n".join(res), joins
+
+def postprocess(md_text, pages):
+    """Phase 3.7 主入口：页眉剥离（第一篇正文落位之后；独立行删、句首/句尾黏连剥）
+    → 中文重排（段内并接 + 碎段合并，自动拼回被页边界打断的词）。返回 (新md, 报告)。"""
+    heads = detect_running_heads(pages)
+    lines = md_text.split("\n")
+    first_h = next((i for i, ln in enumerate(lines) if ln.startswith("# ")), len(lines))
+    removed = []
+    for i in range(first_h + 1, len(lines)):
+        s = lines[i].strip()
+        if not _plain(s):
+            continue
+        ns = norm(s)
+        if ns in heads:
+            removed.append({"line": i + 1, "text": s, "how": "独立行"})
+            lines[i] = ""
+            continue
+        for hk, hv in heads.items():
+            if len(ns) <= len(hk) + 4:
+                continue
+            if s.startswith(hv):
+                lines[i] = s[len(hv):].strip()
+                removed.append({"line": i + 1, "text": hv, "how": "句首黏连"})
+                break
+            if s.endswith(hv):
+                lines[i] = s[:-len(hv)].strip()
+                removed.append({"line": i + 1, "text": hv, "how": "句尾黏连"})
+                break
+    md2, joins = reflow_paragraphs("\n".join(lines))
+    return md2, {"head_set": sorted(heads.values()),
+                 "heads_removed": removed, "reflow_joins": joins}
 
 def main():
     ap = argparse.ArgumentParser()

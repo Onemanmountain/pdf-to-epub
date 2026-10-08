@@ -66,6 +66,40 @@ def load_blocks(mid_dir):
                                "bbox": b.get("bbox"), "text": text.strip()})
     return blocks
 
+# v0.3.1 修复四：成对符号配对检测。“”在多段长引文中可跨块（每段以“开头仅末段以”结尾），
+# 故“”只在「同块内左右都存在但数量不等」时才报警（换页处多识引号的典型形态）；
+# 《》（）「」‘’ 不跨块，任何不平衡都报警。
+PAIR_STRICT = {"《": "》", "（": "）", "「": "」", "‘": "’"}
+
+def pair_imbalance(t):
+    bad = [f"{l}{r}" for l, r in PAIR_STRICT.items() if t.count(l) != t.count(r)]
+    if not bad and t.count("“") > 0 and t.count("”") > 0 and t.count("“") != t.count("”"):
+        bad.append("“”")
+    return bad
+
+# v0.3.1 修复一配套：写回前对齐修剪与字体一致性护栏
+import difflib
+
+def trim_to_span(old, new):
+    """裁块带背景边距，模型转录可能带出目标文段头尾之外的内容（邻段尾巴）。
+    头尾纯插入段剥除——邻段边界是系统已知的，剥除是确定性操作不是猜测；
+    中段插入一律保留（可能是 OCR 漏字的真实补全）。返回 (修剪后文本, 剥掉的内容)。"""
+    sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    ops = sm.get_opcodes()
+    left = new[ops[0][3]:ops[0][4]] if ops and ops[0][0] == "insert" else ""
+    right = new[ops[-1][3]:ops[-1][4]] if ops and ops[-1][0] == "insert" else ""
+    if left:
+        new = new[len(left):]
+    if right:
+        new = new[:-len(right)]
+    return new, (left + ("…" if left and right else "") + right)
+
+TRAD_SET = set("學習時間問題國家會議東門車馬龍鳳複雜後裡麼書寫話語讀聽聲醫萬與長無為這來對關於經過開關現在點從還進運過道那說她他們")
+
+def trad_pollution(old, new):
+    """提案里的繁体字比原文多 → 模型擅自转字体（鲁迅案同族），拒绝。"""
+    return sum(1 for c in new if c in TRAD_SET) > sum(1 for c in old if c in TRAD_SET)
+
 # ---------------- Stage A：块级启发式 ----------------
 
 def flag_blocks(blocks):
@@ -87,6 +121,10 @@ def flag_blocks(blocks):
         trad = [c for c in t if c in TRAD_CHARS]
         if kind is None and len(trad) >= 2:
             kind, detail = "trad_mix", f"繁体混入: {''.join(trad[:6])}"
+        if kind is None:
+            bad = pair_imbalance(t)
+            if bad:
+                kind, detail = "unbalanced_pair", f"成对符号不配: {','.join(bad)}"
         if kind:
             flags.append({**b, "idx": i, "kind": kind, "detail": detail})
     return flags
@@ -298,21 +336,33 @@ def main():
                     with open(img, "rb") as fh:
                         truth = ollama_chat(
                             args.ollama_url, args.ollama_vl_model,
-                            f"这是图书《{title}》扫描页中的一个文字区域。请逐字转录图中文字，"
-                            f"不要解释，不要加空格。按图中实际字形原样输出，"
-                            f"不要把简体转换成繁体，也不要把繁体转换成简体。",
+                            f"这是图书《{title}》扫描页中的一个文字区域。图中除了需要辨认的目标文段，"
+                            f"还包含它前后的背景文字（仅供你定位，不要转录）。\n"
+                            f"目标文段在书中的 OCR 文本是：「{f['text'][:120]}」\n"
+                            f"请只逐字转录与目标文段对应的图中文字（可修正其中的识别错误），"
+                            f"不要输出任何背景文字，不要解释。严格按图中实际字形输出："
+                            f"简体就是简体，不要把简体转换成繁体。",
                             images_b64=[base64.b64encode(fh.read()).decode()]).strip()
                 else:
                     truth = qwen2vl_read(model, proc, pvi, img, title)
             except Exception as e:
                 truth = f"<error {e}>"
             norm = lambda s: re.sub(r"[\s，。,.、·:：;；\"'“”‘’《》<>!\[\]【】]", "", s)
+            # v0.3.1 修复一：写回前对齐修剪（剥除模型带出的邻段头尾）+ 繁体污染护栏
+            truth, stripped = trim_to_span(f["text"], truth)
+            if stripped:
+                print(f"    ✂ 剥除越界转录 {len(stripped)} 字: {stripped[:24]!r}")
             rec = {"page": f["page"], "suspicion": f["text"], "vlm_read": truth}
             report["vlm"].append(rec)
             differ = norm(truth) and norm(truth) != norm(f["text"])
             print(f"  p{f['page']} {f['text'][:26]!r} -> VLM {truth[:26]!r} {'⚠不同' if differ else ''}")
             if not differ:
-                continue  # 视觉确认 OCR 无误，结案
+                continue  # 视觉确认 OCR 无误（或修剪后无实质差异），结案
+            if trad_pollution(f["text"], truth):
+                report.setdefault("needs_review", []).append(
+                    {"page": f["page"], "old": f["text"], "vlm": truth, "judge": "",
+                     "note": "提案含新增繁体字（模型擅自转字体），拒落地转仲裁"})
+                continue
             # 收缩/超长护栏：转录比原文短 20%+ 或长 2 倍 → 裁块不完整/越界，转整页仲裁
             ratio = len(truth) / max(1, len(f["text"]))
             if not (0.8 <= ratio <= 2.0):
