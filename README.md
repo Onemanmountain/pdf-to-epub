@@ -1,121 +1,82 @@
 # pdf-to-epub
 
-把扫描版 PDF 转成**可重排（reflowable）EPUB** 的本地流水线：MinerU 解析 → 本地双模型三级校验 → pandoc 封装。全程离线，零 API 费用，为你的 Kindle/阅读器而生。
+把扫描版 PDF 转成**可重排（reflowable）EPUB** 的本地流水线：视觉侦察 → MinerU 解析 → 结构重建 → 三级校验+整页仲裁 → pandoc 封装 → 自动质检。目标阅读器是 Kindle——成品以能顺利经亚马逊服务器转 KFX 为准绳。
 
-> Scanned-PDF → reflowable EPUB pipeline. MinerU parsing → local dual-LLM triple verification (Qwen3 judge + Qwen2.5-VL page-level recheck) → pandoc. Fully offline, zero API cost. 目前针对现代简体中文图书调优。
+> Scanned-PDF → reflowable EPUB pipeline. v0.2.0：单一引擎 × 双模式（批量智能 auto / 主动审阅 guided）× 双接口（CLI/GUI）。**规则零硬编码**：每本书的结构规律由系统在运行时发现、验证、生成、用完即弃。目前针对现代简体中文图书调优。
 
 ## 为什么需要它
 
-Calibre 直接转 PDF 常常切错章、丢版式；纯 OCR 工具转出来的文字带着满身错字就封装了。本项目的增量是**校验层**：转换完不直接交付，而是让两个本地模型对 OCR 结果做三级漏斗审查，拿不准的一律留给人工——宁可多审，绝不改错。
+Calibre 直接转 PDF 常常切错章、丢版式；纯 OCR 工具转出来的文字带着满身错字就封装了；MinerU 解析强大，但标题检测在美术字篇名页上会失灵、目录页条目会被误当标题。本项目的增量是**侦察层 + 结构层 + 校验层**：转换前先让视觉模型"翻一翻"这本书、现场总结出它的结构规律；转换后对 OCR 结果做三级漏斗审查，拿不准的一律保守保持原文并记入报告——宁可多审，绝不改错。
 
-## 流水线
+## 架构（v0.2.0）
 
 ```
-PDF ──► MinerU 解析 ──► markdown + 插图 + 块坐标(middle_json)
-                          │
-                          ▼ 三级校验漏斗
-              Stage A  规则启发式扫描（全书 → 十余个可疑点）
-                ▼
-              Stage A3 Qwen3-8B 裁判逐条裁决（wrong / corrected）
-                ▼
-              Stage B  Qwen2.5-VL 按 bbox 裁块、300dpi 定向复核
-                ▼
-              双确认铁律：裁判与 VLM 规范化后一致 + 全文唯一 → 自动修
-                          其余一律进 needs_review 人工审
-                          │
-                          ▼
-                    人工终审 → pandoc → EPUB
+PDF ─► Phase 0  Scout 侦察
+        本地 VL 抽样看 16 页 → 确定性信号聚合出候选规则
+        → 外部强模型仲裁（可插拔，可选）→ book_profile.json（本次运行的立法，用完即弃）
+    ─► Phase 1  MinerU 解析（markdown + 插图 + 块坐标 middle_json）
+    ─► Phase 2  结构重建（profile 规则 × middle_json → 篇/编边界 → 标题层级修复）
+    ─► Phase 3  三级校验（启发式 → 裁判 → VLM 裁块复核；双确认 + 唯一性 + 收缩护栏）
+    ─► Phase 3+ 批量智能仲裁（needs_review 整页重判；do-no-harm 保持原文）
+    ─► Phase 4  pandoc 封装 → EPUB 自动质检（zip 结构 / manifest / TOC 落点对账）
+    ─► conversion_report.json（全程审计 + needs_human 旗标）
 ```
 
-## 实测效果
+架构图见 `docs/architecture-v0.2.0.html`（浏览器打开）。
 
-两本现代中文扫描书（263 页 / 200 页）：
+## 实测效果（auto 模式，零人工干预）
 
-| 指标 | 结果 |
-|---|---|
-| MinerU standard 档解析后可疑点 | 13-15 处（basic 档为大量错字） |
-| 自动修改落地 | 0-1 处（双确认+唯一性护栏，宁缺毋滥） |
-| 进人工审 | 2-5 处（含竖排题字等真·盲区） |
-| 单本耗时（RTX 级 GPU） | 解析 ~5-10 min + 校验 ~20-25 min |
+| 书 | 页数/类型 | 结构重建 | 校验+仲裁 | 质检 |
+|---|---|---|---|---|
+| 文集（200p，23 篇选本） | MinerU 丢失篇名页 | **23/23 篇边界全部重建** | 13 可疑点：11 澄清 / 2 处保守保持 | TOC 40/40 命中 |
+| 纪实（250p，编-章结构） | 8 编 + 2 附录 | **12/12 边界**（编名页跨块组合标题也命中） | 17 存疑：落地 3 / 保守保持 14 → needs_human | TOC 66/66 命中 |
 
-护栏有效性实录：裁判模型曾把"胡适"判错并给出合并下文式的幻觉纠正（"读书 胡适"），双确认+唯一性护栏将其全部拦下，0 处错误落地。
+**泛化验证亮点**：第二本书上，聚合层误把"正文中的名人生平段"当成篇界信号（过拟合），外部仲裁层按证据强度否决了这条规则——「本地 VL 看页（便宜）+ 聚合生成候选（免费）+ 外部强模型仲裁（质量）」的混合立法架构按设计工作了。
 
-## 安装
+## 快速开始
 
-**前置**：Windows + NVIDIA GPU（验证环境：16GB 显存；CPU 未测试）、Python 3.11+、PowerShell 5.1+
+前提：Windows + NVIDIA GPU（8GB+）、`pandoc` 在 PATH、MinerU venv（`~\mineru-venv` 或 `MINERU_VENV`）、Ollama 便携版（qwen3:8b + qwen2.5vl:7b）。
 
 ```powershell
-# 1. MinerU 环境（按其官方文档，或用下面的精简路径）
-python -m venv mineru-venv
-mineru-venv\Scripts\pip install mineru[core]==4.0.10 -i https://pypi.org/simple
-mineru-venv\Scripts\pip install -r requirements.txt
+# 交互式（推荐）：逐项询问，auto/guided 可选
+.\scripts\pdf-to-epub.ps1
 
-# 2. Ollama（默认校验后端）—— https://ollama.com 下载
-ollama pull qwen3:8b
-ollama pull qwen2.5vl:7b     # 注意官方库名无连字符
+# 直接命令行
+.\scripts\pdf-to-epub.ps1 -Pdf book.pdf -Title 书名 -Author 某人 -Mode auto
 
-# 3. pandoc —— https://pandoc.org
+# GUI（最简图形界面，批量智能模式）
+C:\Users\<你>\mineru-venv\Scripts\python.exe gui.py   # 然后开 http://127.0.0.1:7861
+
+# 引擎裸 CLI
+python -m engine.pipeline --pdf book.pdf --title 书名 --mode auto
 ```
 
-**自检**：依赖完整性建议跑一遍（曾有环境因 PYTHONPATH 污染掩盖缺包）：
+双模式：`auto` 批量智能（零干预，不一致项保守保持原文并记报告）；`guided` 主动审阅（校验后暂停，人工改 md 后回车继续封装）。
 
-```powershell
-$env:PYTHONPATH=$null; mineru-venv\Scripts\python -m pip check
-```
+## 配置
 
-## 使用
+- `config.yaml`：入库模板（本地 ollama 为默认后端）
+- `config.local.yaml：**gitignored**，放外部仲裁 API 凭证（OpenAI 兼容端点：`api_base` / `api_key` / `api_model`）。配上后 Phase 0 自动启用外部仲裁层；不配则纯本地运行（聚合层兜底）。
+- 环境变量 `SCOUT_API_KEY` 可覆盖 key。
 
-`epub_verify.py` 必须与 `pdf-to-epub.ps1` 放在同一目录。
+## 已知不足（诚实清单）
 
-```powershell
-# 交互模式（逐项询问 PDF 路径 / 书名 / 作者 / 输出目录）
-.\pdf-to-epub.ps1
+详见 `docs/limitations.md`。当前最重要的三条：
 
-# 全自动
-.\pdf-to-epub.ps1 -Pdf "D:\books\某书.pdf" -Title "某书" -Author "某某"
+1. **文本裁判看不见页面**：校验漏斗中裁判环节无视觉，长段落报警时只能凭空猜（曾致 3 处破坏性落地，收缩护栏已堵住落地端，机制根源未除）
+2. **标题体系无调和层**：MinerU 的页面级字体投票与文档级证据未调和——目录页条目、编名页残留块、正文加粗句仍会以标题身份漏进成品
+3. **页脚注按页①重置**：流式 EPUB 中多个①互相歧义
 
-# 帮助与全部参数
-.\pdf-to-epub.ps1 -Help
-```
+## 路线图（已立项，v0.3.0 方向）
 
-流程走到 [3/4] 会暂停：打开 `verify_report.json` 看 `needs_review`，对照原 PDF 手改 `<书名>-fixed.md`，回车继续，自动封装 EPUB（与 PDF 同目录，重名自动加序号）。
+- **视觉裁判**：修改提案权只归看得见证据的环节；文本模型降为只能否决不能提案
+- **结构调和器**：四方证据（页眉规则 / 目录页条目 / MinerU 字体投票 / 编号模式）→ 唯一章节树 → 标题全部由树重新生成（根治标题重复与多余，而非逐条打补丁）
+- **脚注规范化**：全书连续编号 + pandoc 原生 `[^n]` 脚注，按页归组配对，Kindle KFX 转换为验收准绳
 
-**transformers 后端**（不依赖 Ollama 服务，直连 HF 权重，4bit 量化）：
+## 版权与合规
 
-```powershell
-$env:MODELS_ROOT = "D:\models"   # 下含 Qwen3-8B 与 Qwen2.5-VL-7B-Instruct
-.\pdf-to-epub.ps1 -Backend transformers
-```
-
-## 已知边界（重要，使用前请读）
-
-- **"校验通过"≠"全书无误"**：Stage A 启发式只覆盖几类错误模式（数字嵌词/繁简混杂/孤立短块/标题页码尾缀），无语义级查错能力，无召回率保证
-- **竖排文字是公认盲区**：OCR 与 VLM 对竖排题字/古籍都不可靠，靠人工审兜底
-- **低清书法字的裁块级 VLM 转录仍可能出错**：护栏（双确认+人工）是承重墙，不是 VLM 准确率
-- 复杂版式（多栏/脚注混排）的章节切分未充分测试
-- 启发式字符集为手写小集合，目前只针对现代简体中文图书调优
-
-详见 [docs/limitations.md](docs/limitations.md) 与 [docs/pipeline.md](docs/pipeline.md)。
-
-## 目录结构
-
-```
-scripts/
-  pdf-to-epub.ps1   # 交互式一条龙入口
-  epub_verify.py    # 三级校验核心（--backend ollama|transformers）
-docs/
-  pipeline.md       # 技术路线与设计决策
-  limitations.md    # 已知边界与失败案例
-CHANGELOG.md
-requirements.txt
-```
-
-## 贡献
-
-Issue / PR 都欢迎：新的错误模式启发式、其他语种字符集、CPU 适配、批量模式都是好方向。提交前请用一本真书实测并在 PR 里贴 `verify_report.json` 摘要。
+本仓库**不含任何书籍内容**（`.gitignore` 强制）。请仅对你有权处理的 PDF 使用本工具，转换产物遵守原书版权。
 
 ## License
 
-MIT — 详见 [LICENSE](LICENSE)。
-
-**版权提醒**：请只转换你有权使用的 PDF。本仓库不包含也不接受任何受版权保护的书籍内容，PR 中附带书籍文本将被拒绝。
+MIT © 2026 Onemanmountain
