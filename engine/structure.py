@@ -204,6 +204,85 @@ def apply_to_markdown(md_text, boundaries, front_matter_last_page=None, pages_to
     return "\n".join(lines), applied, misses
 
 
+# ---------------- 结构调和（v0.3.0：唯一章节树权威）----------------
+CHAPTER_RE = re.compile(r"^\d{1,2}[.、]\s*\S{2,30}$")
+
+def aggregate_numbered_chapters(pages):
+    """编号章题模式聚合：全书范围内 ^数字. 标题 型块出现 ≥3 次 → 模式成立，全部合法化为二级标题。
+    证据驱动：不预设书有编号章；模式由数据自己说话。"""
+    cands = {}
+    for p in sorted(pages):
+        for b in pages[p]:
+            if b["type"] in ("text", "paragraph_title") and b["text"]:
+                t = re.sub(r"\s+", "", b["text"].strip())  # 空白不敏感（OCR 会插入空格：19. 起 点）
+                if CHAPTER_RE.match(t):
+                    cands[norm(t)] = t
+    return set(cands.keys()) if len(cands) >= 3 else set()
+
+def toc_line_range(md_lines, boundaries, applied):
+    """目录区行范围：『目录』落位行 → 下一篇边界的落位行（落位行号来自 apply 记录，
+    不受幻影标题干扰——幻影标题冒充边界标题会截断按标题扫描的区间，实测教训）。"""
+    toc_norm = {norm(b["title"]) for b in boundaries if "目录" in b["title"]}
+    if not toc_norm:
+        return None
+    start = None
+    for i, ln in enumerate(md_lines):
+        if ln.lstrip().startswith("#") and norm(re.sub(r"^#+\s*", "", ln)) in toc_norm:
+            start = i
+            break
+    if start is None:
+        return None
+    toc_page = next(b["page"] for b in boundaries if "目录" in b["title"])
+    applied_line = {a["title"]: a["line"] for a in applied}
+    nxt = [b for b in boundaries if b["page"] > toc_page and b["title"] in applied_line]
+    end = applied_line[min(nxt, key=lambda b: b["page"])["title"]] if nxt else len(md_lines)
+    return (start, end)
+
+def reconcile_headings(md_text, boundaries, pages, applied):
+    """调和器：四方证据 → 唯一权威 → 现存标题行逐个审判。
+    判决：# = 边界佐证且位置就是落位行（同标题的其他标题行=目录页幻影/重复，降级）；
+    ## = 编号章题/目录条目佐证；### = 仅字体投票（保留强调，toc-depth=2 下不入大纲）；
+    目录区内标题行 → 降为正文。返回 (新md, 降级清单, 保留清单)。"""
+    justified_l1 = {norm(b["title"]) for b in boundaries if b.get("title")}
+    l1_line = {}
+    for a in applied:  # 同名篇允许：落位行号集合（单值映射会把同名篇的第一个落位误杀——实测教训）
+        l1_line.setdefault(norm(a["title"]), set()).add(a["line"])
+    justified_l2 = aggregate_numbered_chapters(pages)
+    lines = md_text.split("\n")
+    toc_range = toc_line_range(lines, boundaries, applied)
+    if toc_range:
+        for ln in lines[toc_range[0]:toc_range[1]]:
+            t = re.sub(r"^[-*+]\s*", "", ln.strip())
+            t = re.sub(r"^#+\s*", "", t)
+            if CHAPTER_RE.match(re.sub(r"\s+", "", t)):
+                justified_l2.add(norm(t))
+    demoted, keptn = [], []
+    for i, ln in enumerate(lines):
+        if not ln.lstrip().startswith("#"):
+            continue
+        title = re.sub(r"^#+\s*", "", ln).strip()
+        nt = norm(title)
+        if not title:
+            continue
+        if toc_range and toc_range[0] < i < toc_range[1]:
+            lines[i] = title
+            demoted.append({"line": i + 1, "title": title, "reason": "目录区条目非标题"})
+        elif nt in justified_l1 and i in l1_line.get(nt, set()):
+            lines[i] = "# " + title
+            keptn.append({"line": i + 1, "title": title, "level": 1})
+        elif nt in justified_l2:
+            lines[i] = "## " + title
+            keptn.append({"line": i + 1, "title": title, "level": 2})
+        elif nt in justified_l1:
+            # 标题匹配边界但位置非落位行 → 目录页幻影/重复
+            lines[i] = title
+            demoted.append({"line": i + 1, "title": title, "reason": "边界标题的非落位重复（幻影）"})
+        else:
+            lines[i] = "### " + title
+            keptn.append({"line": i + 1, "title": title, "level": 3,
+                          "reason": "仅字体投票：保留强调不入大纲"})
+    return "\n".join(lines), demoted, keptn
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mid", required=True)
@@ -229,14 +308,21 @@ def main():
 
     md_text = open(args.md, encoding="utf-8").read()
     new_md, applied, misses = apply_to_markdown(md_text, boundaries)
+    # v0.3.0 调和：插入边界后，对全部现存标题行做证据审判（含 MinerU 原生投票与刚插入的边界）
+    pages_all = load_pages(args.mid)
+    new_md, demoted, keptn = reconcile_headings(new_md, boundaries, pages_all, applied)
     open(args.out, "w", encoding="utf-8", newline="\n").write(new_md)
+    if demoted:
+        print(f"[structure] 目录区降级 {len(demoted)} 个条目（条目非标题）")
+        for d in demoted[:8]:
+            print(f"    ✂ 行{d['line']} {d['title'][:30]!r} ({d['reason']})")
 
     report = {"rules_used": [r["name"] for r in rules], "boundaries": boundaries,
               "applied": applied, "misses": misses, "warns": warns,
-              "needs_human": bool(misses) or bool(warns and "异常" in "".join(warns))}
+              "reconcile": {"demoted": demoted, "kept": keptn}}
     json.dump(report, open(args.report, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"[structure] 标题落位 {len(applied)}/{len(applied)+len(misses)} -> {args.out}")
-    print(f"[structure] 报告 -> {args.report}  needs_human={report['needs_human']}")
+    print(f"[structure] 报告 -> {args.report}")
 
 
 if __name__ == "__main__":

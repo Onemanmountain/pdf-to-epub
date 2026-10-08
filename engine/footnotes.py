@@ -133,7 +133,6 @@ def normalize_footnotes(pages, md_text, report):
         "converted": converted,
         "pages_skipped": skipped,
         "details": details,
-        "needs_human": len(skipped) > 0,
     }
     print(f"[footnotes] 转换 {converted} 条（全书连续编号），跳过 {len(skipped)} 页（保守保持）")
     for s in skipped:

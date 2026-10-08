@@ -8,5 +8,6 @@ scout:
   api_base: ""                   # OpenAI 兼容端点，如 https://openrouter.ai/api/v1
   api_key: ""                    # 也可走环境变量 SCOUT_API_KEY
   api_model: ""                  # 如 google/gemini-2.5-pro
+  vision_model: ""               # 外部强视觉终裁（如 doubao-seed-1-6-vision-250815），空=关闭
 engine:
   mode: auto                     # auto（批量智能）| guided（主动审阅）

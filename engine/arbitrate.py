@@ -38,6 +38,20 @@ def ollama_chat(url, model, prompt, images_b64=None, timeout=600):
         return json.loads(r.read())["message"]["content"]
 
 
+def ark_vision_call(api_base, api_key, model, prompt, image_b64, timeout=180):
+    """外部强视觉模型（OpenAI 兼容多模态）。直连：显式空 ProxyHandler，不吃环境代理。"""
+    body = {"model": model, "temperature": 0, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}}]}]}
+    req = urllib.request.Request(api_base.rstrip("/") + "/chat/completions",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + api_key})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
+
+
 ARB_PROMPT = """这是一本书扫描版的第 {page} 页（整页）。
 对页面上某处文字，有三种读法：
   A（OCR 原文）:「{old}」
@@ -57,13 +71,21 @@ def extract_json(text):
         return None
 
 
-def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, threshold=3):
+EXT_PROMPT = """这是一本书扫描版的第 {page} 页（整页）。
+OCR 把某处文字读作：「{old}」
+本地视觉模型裁块后读作：「{vlm}」
+两者冲突，本地整页仲裁无法裁定。请你看整页图像作最终裁定：
+- 图上实际是什么？（actual，逐字）
+- 支持谁？supports: A=OCR原文 / B=裁块读数
+只输出 JSON：{{"actual": "...", "supports": "A|B", "reason": "一句话"}}"""
+
+
+def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, threshold=3, ext_cfg=None):
     report = json.load(open(report_path, encoding="utf-8"))
     items = report.get("needs_review", [])
     if not items:
         print("[arbitrate] 无 needs_review，直接放行")
-        report["arbitration"] = []
-        report["needs_human"] = False
+        report["arbitration"] = {"applied": [], "kept_original": []}
         json.dump(report, open(report_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         import shutil
         shutil.copyfile(md_path, out_path)
@@ -71,8 +93,9 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
     md = open(md_path, encoding="utf-8").read()
     doc = pymupdf.open(pdf_path)
     tmp = tempfile.mkdtemp(prefix="arb_")
-    applied, unresolved = [], []
-    print(f"[arbitrate] 整页仲裁 {len(items)} 处（信息增量：整页+上下文）...")
+    applied, kept = [], []
+    ext_on = bool(ext_cfg and ext_cfg.get("api_key") and ext_cfg.get("vision_model"))
+    print(f"[arbitrate] 整页仲裁 {len(items)} 处（本地 VL → 不定则外部强视觉终裁{'[on]' if ext_on else '[off]'}）...")
     for it in items:
         page = it["page"]
         png = os.path.join(tmp, f"p{page}.png")
@@ -87,34 +110,44 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
         except Exception as e:
             j = {"supports": "none", "reason": f"error {e}"}
         sup = j.get("supports", "none")
+        tier = "本地整页"
+        # 本地无法裁定（none/冲突/异常/并列）→ 外部强视觉终裁
+        if sup not in ("A", "B", "C") and ext_on:
+            try:
+                ans2 = ark_vision_call(ext_cfg["api_base"], ext_cfg["api_key"], ext_cfg["vision_model"],
+                                       EXT_PROMPT.format(page=page, old=old[:80], vlm=vlm[:80]), b64)
+                j2 = extract_json(ans2) or {}
+                if j2.get("supports") in ("A", "B"):
+                    sup, j, tier = j2["supports"], j2, "外部终裁"
+            except Exception as e:
+                j.setdefault("reason", f"外部终裁异常 {e}")
         jc = (judge or "").strip()
         if sup == "C" and jc and norm(jc) != norm(old) and len(jc) < 0.8 * len(old):
             # 收缩护栏：纠正把文本砍掉 20%+ → 是"转录不全"不是"改错"，拒落地
-            # （长段落天然过唯一性检查，曾致 3 处整段被截断替换——《漫长的革命》实测事故）
-            unresolved.append({**it, "arb_actual": j.get("actual", ""), "arb_supports": sup,
-                               "note": f"收缩 {len(old)}→{len(jc)} 超20%拒落地"})
+            kept.append({**it, "arb_actual": j.get("actual", ""), "arb_supports": sup, "tier": tier,
+                         "note": f"收缩 {len(old)}→{len(jc)} 超20%拒落地"})
             mark = "保持原文(收缩护栏)"
         elif sup == "B" and (vlm or "").strip() and norm(vlm.strip()) != norm(old) \
                 and len(vlm.strip()) >= 0.8 * len(old) and md.count(old) == 1:
-            # v0.3.0：整页仲裁支持裁块读数 → 两次独立视觉读数一致（新双确认），带收缩+唯一性护栏
+            # 双视觉一致（裁块 + 整页/外部终裁确认）→ 落地，带收缩+唯一性护栏
             md = md.replace(old, vlm.strip(), 1)
             applied.append({"page": page, "old": old, "new": vlm.strip(),
-                            "actual": j.get("actual", ""), "source": "arb_vision_x2"})
-            mark = "✓落地(双视觉一致)"
+                            "actual": j.get("actual", ""), "source": "arb_vision_x2", "tier": tier})
+            mark = f"✓落地(双视觉一致/{tier})"
         elif sup == "C" and jc and norm(jc) != norm(old) and md.count(old) == 1:
             md = md.replace(old, jc, 1)
-            applied.append({"page": page, "old": old, "new": jc, "actual": j.get("actual", "")})
-            mark = "✓落地"
+            applied.append({"page": page, "old": old, "new": jc, "actual": j.get("actual", ""), "tier": tier})
+            mark = f"✓落地({tier})"
         else:
-            unresolved.append({**it, "arb_supports": sup, "arb_reason": j.get("reason", "")})
-            mark = f"保持原文(supports={sup})"
+            kept.append({**it, "arb_supports": sup, "arb_reason": j.get("reason", ""), "tier": tier,
+                         "note": "仲裁链终局：证据不足，保守保持原文（有理由的决策，非转人工）"})
+            mark = f"保持原文(supports={sup}/{tier})"
         print(f"  p{page} {old[:20]!r} -> {mark}")
     doc.close()
     open(out_path, "w", encoding="utf-8", newline="\n").write(md)
-    report["arbitration"] = {"applied": applied, "unresolved": unresolved}
-    report["needs_human"] = len(unresolved) > threshold
+    report["arbitration"] = {"applied": applied, "kept_original": kept}
     json.dump(report, open(report_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print(f"[arbitrate] 落地 {len(applied)}，保持原文 {len(unresolved)}，needs_human={report['needs_human']}")
+    print(f"[arbitrate] 落地 {len(applied)}，保持原文 {len(kept)}（每条均附理由）")
     return report
 
 

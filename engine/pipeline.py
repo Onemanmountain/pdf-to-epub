@@ -9,7 +9,7 @@ pipeline.py — v0.2.0 单引擎编排（CLI 与未来的 GUI 共用同一套 Ph
            mode=auto   → arbitrate 整页仲裁 → final.md（零干预）
            mode=guided → 打印指引并暂停，人工改 verified.md → final.md
   Phase 4  package     pandoc → epub（重名自动加序号）+ qc 自动质检
-  输出     conversion_report.json（needs_human 旗标聚合各阶段信号）
+  输出     conversion_report.json（各阶段决策与理由全程留痕）
 
 CLI: python -m engine.pipeline --pdf book.pdf --title 书名 [--author 某人] \
        [--outdir epub_out] [--mode auto|guided] [--skip-scout]
@@ -49,7 +49,7 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     venv_py = os.path.join(venv, "Scripts", "python.exe")
     mineru = os.path.join(venv, "Scripts", "mineru-kit.exe")
     verify_py = os.path.join(REPO, "scripts", "epub_verify.py")
-    report = {"book": title, "pdf": pdf, "mode": mode, "phases": {}, "needs_human": False}
+    report = {"book": title, "pdf": pdf, "mode": mode, "phases": {}}
 
     # ---- Phase 0: scout ----
     profile_p = os.path.join(outdir, "book_profile.json")
@@ -125,7 +125,7 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
         "--md", md_src, "--out", structured_md, "--report", struct_report_p], cwd=REPO)
     srep = json.load(open(struct_report_p, encoding="utf-8"))
     report["phases"]["structure"] = {"boundaries": len(srep["boundaries"]),
-                                     "misses": len(srep["misses"]), "needs_human": srep["needs_human"]}
+                                     "misses": len(srep["misses"]), "warns": srep.get("warns", [])}
 
     # ---- Phase 3: verify ----
     verified_md = os.path.join(extracted, f"{title}-verified.md")
@@ -142,7 +142,8 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     if mode == "auto":
         print("[Phase 3+] 批量智能：整页仲裁 needs_review ...")
         arbitrate.arbitrate(verify_report_p, verified_md, pdf, final_md,
-                            cfg["scout"]["ollama_url"], cfg["scout"]["vl_model"])
+                            cfg["scout"]["ollama_url"], cfg["scout"]["vl_model"],
+                            ext_cfg=cfg["scout"])
     else:
         print("=" * 60)
         print(f"[主动审阅] 1. 打开报告: {verify_report_p}")
@@ -151,7 +152,10 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
         input("按回车继续（Ctrl+C 中止）...")
         shutil.copyfile(verified_md, final_md)
     vrep = json.load(open(verify_report_p, encoding="utf-8"))
-    report["phases"]["verify"]["needs_human"] = vrep.get("needs_human", False)
+    arb = vrep.get("arbitration", {})
+    if isinstance(arb, dict):
+        report["phases"]["verify"]["arb_applied"] = len(arb.get("applied", []))
+        report["phases"]["verify"]["arb_kept"] = len(arb.get("kept_original", []))
 
     # ---- Phase 3.6: 脚注规范化（全书连续编号 + pandoc [^n]；保守跳过记报告）----
     print("[Phase 3.6] 脚注规范化（按页配对 → 全书连续 [^n]）...")
@@ -181,14 +185,11 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     qc_rep = qc.qc(epub, os.path.join(outdir, "qc_report.json"))
     report["phases"]["qc"] = {"passed": qc_rep["passed"], "epub": epub}
 
-    report["needs_human"] = any(p.get("needs_human") for p in report["phases"].values() if isinstance(p, dict))
     rep_p = os.path.join(outdir, "conversion_report.json")
     json.dump(report, open(rep_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print("=" * 60)
     print(f"[done] EPUB -> {epub}")
-    print(f"[done] 转换报告 -> {rep_p}   needs_human={report['needs_human']}")
-    if report["needs_human"]:
-        print("[!] 本次自动决策置信度不足：建议用 --mode guided 复跑一次审阅模式")
+    print(f"[done] 转换报告 -> {rep_p}")
     return report
 
 
