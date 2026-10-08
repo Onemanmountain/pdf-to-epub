@@ -94,6 +94,13 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
             unresolved.append({**it, "arb_actual": j.get("actual", ""), "arb_supports": sup,
                                "note": f"收缩 {len(old)}→{len(jc)} 超20%拒落地"})
             mark = "保持原文(收缩护栏)"
+        elif sup == "B" and (vlm or "").strip() and norm(vlm.strip()) != norm(old) \
+                and len(vlm.strip()) >= 0.8 * len(old) and md.count(old) == 1:
+            # v0.3.0：整页仲裁支持裁块读数 → 两次独立视觉读数一致（新双确认），带收缩+唯一性护栏
+            md = md.replace(old, vlm.strip(), 1)
+            applied.append({"page": page, "old": old, "new": vlm.strip(),
+                            "actual": j.get("actual", ""), "source": "arb_vision_x2"})
+            mark = "✓落地(双视觉一致)"
         elif sup == "C" and jc and norm(jc) != norm(old) and md.count(old) == 1:
             md = md.replace(old, jc, 1)
             applied.append({"page": page, "old": old, "new": jc, "actual": j.get("actual", "")})

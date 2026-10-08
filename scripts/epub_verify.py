@@ -124,6 +124,17 @@ OCR 文本：「{span}」
 
 只输出 JSON：{{"wrong": true/false, "corrected": "正确文本或原文", "reason": "一句话"}}"""
 
+# v0.3.0 视觉裁判：文本模型降级为只能否决（veto-only），不许提出第三种写法。
+# 提案权归视觉端（裁块转录是 grounded 提案）；文本否决只是上下文合理性刹车。
+VETO_PROMPT = """图书《{title}》的 OCR 把某区域读作「{old}」，视觉模型直接看图后认为应为「{new}」。
+
+同页上下文：「{context}」
+
+你只有两个选择（不允许提出第三种写法）：
+- 如果「{new}」在上下文中明显不通（语法断裂/语义矛盾/专名写错），否决它：{{"veto": true, "reason": "一句话"}}
+- 否则放行：{{"veto": false}}
+只输出 JSON。"""
+
 def load_qwen2vl(path):
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, BitsAndBytesConfig
@@ -238,44 +249,8 @@ def main():
               "judged": [], "vlm": [], "applied": []}
     corrected = md_text
 
-    # ---- Stage A3: Qwen3 裁判 ----
-    judged = []
-    if flags and not args.no_judge:
-        print(f"[Stage A3] Qwen3 裁判中... (backend={args.backend})")
-        norm0 = lambda s: re.sub(r"[\s，。,.、·:：;；\"'“”‘’《》<>!\[\]【】]", "", s or "")
-        use_ollama = args.backend == "ollama"
-        if not use_ollama:
-            model, tok = load_qwen3(args.qwen3)
-        for f in flags:
-            ctx = " ".join(b["text"] for b in blocks
-                           if b["page"] == f["page"])[:400]
-            prompt = JUDGE_PROMPT.format(title=title, kind=f["kind"],
-                                         detail=f["detail"], span=f["text"][:150], context=ctx)
-            try:
-                if use_ollama:
-                    ans = ollama_chat(args.ollama_url, args.ollama_text_model,
-                                      prompt, think=False)
-                else:
-                    ans = qwen3_chat(model, tok, prompt)
-                m = re.search(r"\{.*\}", ans, re.S)
-                j = json.loads(m.group(0)) if m else {}
-            except Exception as e:
-                j = {"error": str(e)}
-            # 幻觉护栏：判 wrong 但 corrected 与原文相同 → 视为误报
-            if j.get("wrong") and norm0(j.get("corrected")) == norm0(f["text"]):
-                j["wrong"] = False
-                j["note"] = "corrected==original, treated as false positive"
-            judged.append({**f, "judge": j})
-            mark = "✗错" if j.get("wrong") else "✓对"
-            print(f"  {mark} p{f['page']} {f['text'][:32]!r} -> {j.get('corrected','')[:28]!r}")
-        report["judged"] = [{k: v for k, v in j.items() if k != "bbox"} for j in judged]
-        if use_ollama:
-            ollama_unload(args.ollama_url, args.ollama_text_model)
-        else:
-            del model
-            import torch; torch.cuda.empty_cache()
-    else:
-        judged = [{**f, "judge": {}} for f in flags]
+    # v0.3.0：旧 Stage A3（文本裁判先提案）已废除——提案权归视觉端。
+    # 流程改为：Stage B 全量视觉裁决（VL 裁块转录=grounded 提案）→ 文本否决（veto-only）→ Stage C 落地。
 
     # 机械修复：标题页码尾缀无需模型裁决，直接剥除
     norm = lambda s: re.sub(r"[\s，。,.、·:：;；\"'“”‘’《》<>!\[\]【】]", "", s or "")
@@ -294,10 +269,10 @@ def main():
                     {"page": f["page"], "old": f["text"], "vlm": "", "judge": stripped,
                      "note": "mechanical strip but text occurs multiple times - manual"})
 
-    # 待视觉复核：裁判判错（机械修复过的除外）
-    targets = [j for j in judged if j["judge"].get("wrong") and j["text"] not in mech_fixed]
-    print(f"[Stage B] 送视觉复核 {len(targets)} 处")
-
+    # ---- Stage B: 视觉裁决（全量；VL 裁块转录 = grounded 提案）----
+    targets = [f for f in flags if f["text"] not in mech_fixed]
+    print(f"[Stage B] 视觉裁决 {len(targets)} 处（VL 裁块转录，提案权归看证据端）")
+    proposals = []  # [(flag, truth)] 通过比例护栏的视觉提案，待文本否决
     if targets and not args.no_vlm:
         import fitz, tempfile, base64
         use_ollama = args.backend == "ollama"
@@ -308,13 +283,17 @@ def main():
         doc = fitz.open(args.pdf)
         tmp = tempfile.mkdtemp(prefix="verify_")
         skipped_nobox = 0
-        for j in targets:
-            if not j.get("bbox"):
+        for f in targets:
+            if not f.get("bbox"):
                 skipped_nobox += 1
+                # 缺 bbox 无法裁块 → 直接转整页仲裁（仲裁渲染整页，不依赖 bbox）
+                report.setdefault("needs_review", []).append(
+                    {"page": f["page"], "old": f["text"], "vlm": "", "judge": "",
+                     "note": "缺 bbox 无法裁块，转整页仲裁"})
                 continue
-            img = os.path.join(tmp, f"p{j['page']}_b{j['idx']}.png")
+            img = os.path.join(tmp, f"p{f['page']}_b{f['idx']}.png")
             try:
-                render_region(doc, j["page"], j["bbox"], img)
+                render_region(doc, f["page"], f["bbox"], img)
                 if use_ollama:
                     with open(img, "rb") as fh:
                         truth = ollama_chat(
@@ -328,36 +307,81 @@ def main():
             except Exception as e:
                 truth = f"<error {e}>"
             norm = lambda s: re.sub(r"[\s，。,.、·:：;；\"'“”‘’《》<>!\[\]【】]", "", s)
-            rec = {"page": j["page"], "suspicion": j["text"], "vlm_read": truth,
-                   "judge_corrected": j["judge"].get("corrected", "")}
+            rec = {"page": f["page"], "suspicion": f["text"], "vlm_read": truth}
             report["vlm"].append(rec)
-            differ = norm(truth) and norm(truth) != norm(j["text"])
-            print(f"  p{j['page']} {j['text'][:26]!r} -> VLM {truth[:26]!r} {'⚠不同' if differ else ''}")
-            # 自动修正铁律：裁判与 VLM 规范化后一致才落地；其余进 needs_review
-            jc = (j["judge"].get("corrected") or "").strip()
-            agree = jc and norm(jc) == norm(truth) and norm(jc) != norm(j["text"])
-            if agree and 0.5 <= len(jc) / max(1, len(j["text"])) <= 2.0:
-                if corrected.count(j["text"]) == 1:
-                    corrected = corrected.replace(j["text"], jc, 1)
-                    report["applied"].append({"old": j["text"], "new": jc, "page": j["page"],
-                                              "source": "judge+vlm_agree"})
-                else:
-                    # 多处出现时不自动替换（避免命中错误位置）
-                    report.setdefault("needs_review", []).append(
-                        {"page": j["page"], "old": j["text"], "vlm": truth, "judge": jc,
-                         "note": "judge+vlm agree but text not unique in md - manual"})
-            elif differ:
+            differ = norm(truth) and norm(truth) != norm(f["text"])
+            print(f"  p{f['page']} {f['text'][:26]!r} -> VLM {truth[:26]!r} {'⚠不同' if differ else ''}")
+            if not differ:
+                continue  # 视觉确认 OCR 无误，结案
+            # 收缩/超长护栏：转录比原文短 20%+ 或长 2 倍 → 裁块不完整/越界，转整页仲裁
+            ratio = len(truth) / max(1, len(f["text"]))
+            if not (0.8 <= ratio <= 2.0):
                 report.setdefault("needs_review", []).append(
-                    {"page": j["page"], "old": j["text"], "vlm": truth, "judge": jc})
+                    {"page": f["page"], "old": f["text"], "vlm": truth, "judge": "",
+                     "note": f"转录长度比 {ratio:.2f} 越界（裁块不完整或越界），转整页仲裁"})
+                continue
+            proposals.append((f, truth))
         doc.close()
         import shutil; shutil.rmtree(tmp, ignore_errors=True)
         if skipped_nobox:
-            print(f"[!] {skipped_nobox} 处缺 bbox，已跳过视觉复核")
+            print(f"[!] {skipped_nobox} 处缺 bbox，已转整页仲裁")
         if use_ollama:
             ollama_unload(args.ollama_url, args.ollama_vl_model)
         else:
             del model
             import torch; torch.cuda.empty_cache()
+    elif targets:
+        # --no-vlm：无视觉提案，全部转人工
+        for f in targets:
+            report.setdefault("needs_review", []).append(
+                {"page": f["page"], "old": f["text"], "vlm": "", "judge": "", "note": "no-vlm 模式"})
+
+    # ---- Stage A3-veto: 文本模型只能否决（不许提案）----
+    if proposals and not args.no_judge:
+        print(f"[Stage A3] 文本否决审查 {len(proposals)} 条视觉提案（veto-only，不许提案）...")
+        use_ollama = args.backend == "ollama"
+        if not use_ollama:
+            model, tok = load_qwen3(args.qwen3)
+        still = []
+        for f, truth in proposals:
+            ctx = " ".join(b["text"] for b in blocks
+                           if b["page"] == f["page"])[:400]
+            prompt = VETO_PROMPT.format(title=title, old=f["text"][:150],
+                                        new=truth[:150], context=ctx)
+            try:
+                if use_ollama:
+                    ans = ollama_chat(args.ollama_url, args.ollama_text_model,
+                                      prompt, think=False)
+                else:
+                    ans = qwen3_chat(model, tok, prompt)
+                m = re.search(r"\{.*\}", ans, re.S)
+                j = json.loads(m.group(0)) if m else {}
+            except Exception as e:
+                j = {"veto": False, "note": f"error {e}"}  # 否决器故障不挡路，交仲裁/人工
+            if j.get("veto"):
+                report.setdefault("needs_review", []).append(
+                    {"page": f["page"], "old": f["text"], "vlm": truth, "judge": "",
+                     "note": f"文本否决: {j.get('reason', '')[:60]}"})
+                print(f"  ✗否决 p{f['page']} {f['text'][:24]!r} -> {truth[:24]!r}: {j.get('reason','')[:30]}")
+            else:
+                still.append((f, truth))
+        proposals = still
+        if use_ollama:
+            ollama_unload(args.ollama_url, args.ollama_text_model)
+        else:
+            del model
+            import torch; torch.cuda.empty_cache()
+
+    # ---- Stage C: 落地（唯一性护栏）----
+    for f, truth in proposals:
+        if corrected.count(f["text"]) == 1:
+            corrected = corrected.replace(f["text"], truth, 1)
+            report["applied"].append({"old": f["text"], "new": truth, "page": f["page"],
+                                      "source": "vision_propose+veto_pass"})
+        else:
+            report.setdefault("needs_review", []).append(
+                {"page": f["page"], "old": f["text"], "vlm": truth, "judge": "",
+                 "note": "视觉提案已过否决，但原文多处出现不唯一 - manual"})
 
     open(args.out, "w", encoding="utf-8", newline="\n").write(corrected)
     json.dump(report, open(args.report, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
