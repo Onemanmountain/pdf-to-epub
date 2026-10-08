@@ -153,13 +153,28 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     vrep = json.load(open(verify_report_p, encoding="utf-8"))
     report["phases"]["verify"]["needs_human"] = vrep.get("needs_human", False)
 
-    # ---- Phase 4: package + qc ----
+    # ---- Phase 3.6: 脚注规范化（全书连续编号 + pandoc [^n]；保守跳过记报告）----
+    print("[Phase 3.6] 脚注规范化（按页配对 → 全书连续 [^n]）...")
+    from . import footnotes
+    pages = structure.load_pages(extracted)
+    fn_report = {}
+    fn_md = footnotes.normalize_footnotes(pages, open(final_md, encoding="utf-8").read(), fn_report)
+    fn_info = fn_report.get("footnotes", {})
+    if fn_info.get("converted", 0) > 0:
+        epub_md_p = final_md.replace("-final.md", "-epub.md")
+        open(epub_md_p, "w", encoding="utf-8", newline="\n").write(fn_md)
+        pandoc_src = epub_md_p
+    else:
+        pandoc_src = final_md
+    report["phases"]["footnotes"] = fn_info
+
+    # ---- Phase 4: pandoc + QC ----
     pandoc = shutil.which("pandoc")
     if not pandoc:
         raise SystemExit("[X] pandoc 不在 PATH")
     epub = unique_path(os.path.join(os.path.dirname(pdf), f"{title}.epub"))
     print("[Phase 4] pandoc 封装...")
-    sh([pandoc, os.path.basename(final_md), "-o", epub, "-s",
+    sh([pandoc, os.path.basename(pandoc_src), "-o", epub, "-s",
         "--metadata", f"title={title}", "--metadata", f"author={author}",
         "--metadata", "lang=zh-CN", "--toc", "--toc-depth=2"], cwd=os.path.dirname(final_md))
     print("[Phase 4] EPUB 自动质检...")
