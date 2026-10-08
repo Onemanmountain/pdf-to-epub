@@ -38,9 +38,13 @@ def ollama_chat(url, model, prompt, images_b64=None, timeout=600):
         return json.loads(r.read())["message"]["content"]
 
 
-def ark_vision_call(api_base, api_key, model, prompt, image_b64, timeout=180):
-    """外部强视觉模型（OpenAI 兼容多模态）。直连：显式空 ProxyHandler，不吃环境代理。"""
-    body = {"model": model, "temperature": 0, "messages": [{"role": "user", "content": [
+def ark_vision_call(api_base, api_key, model, prompt, image_b64, timeout=300):
+    """外部强视觉模型（OpenAI 兼容多模态）。直连：显式空 ProxyHandler，不吃环境代理。
+    max_tokens 压低：终裁只输出小 JSON，防长生成拖时（200dpi 整页实测 180s 超时两轮）。"""
+    import urllib.request
+    body = {"model": model, "temperature": 0, "max_tokens": 400,
+            "thinking": {"type": "disabled"},  # 终裁只需小 JSON：关思考链 281s→8s 实测，裁决质量不降
+            "messages": [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}}]}]}
     req = urllib.request.Request(api_base.rstrip("/") + "/chat/completions",
@@ -111,16 +115,20 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
             j = {"supports": "none", "reason": f"error {e}"}
         sup = j.get("supports", "none")
         tier = "本地整页"
-        # 本地无法裁定（none/冲突/异常/并列）→ 外部强视觉终裁
+        # 本地无法裁定（none/冲突/异常/并列）→ 外部强视觉终裁（150dpi 控制载荷）
         if sup not in ("A", "B", "C") and ext_on:
             try:
+                png150 = os.path.join(tmp, f"p{page}_150.png")
+                doc[page - 1].get_pixmap(dpi=150).save(png150)
+                b64_150 = base64.b64encode(open(png150, "rb").read()).decode()
                 ans2 = ark_vision_call(ext_cfg["api_base"], ext_cfg["api_key"], ext_cfg["vision_model"],
-                                       EXT_PROMPT.format(page=page, old=old[:80], vlm=vlm[:80]), b64)
+                                       EXT_PROMPT.format(page=page, old=old[:80], vlm=vlm[:80]), b64_150)
                 j2 = extract_json(ans2) or {}
                 if j2.get("supports") in ("A", "B"):
                     sup, j, tier = j2["supports"], j2, "外部终裁"
             except Exception as e:
-                j.setdefault("reason", f"外部终裁异常 {e}")
+                j["ext_error"] = str(e)  # 终裁异常必须留痕（曾被 setdefault 静默吞掉——NameError 实战教训）
+                print(f"    [!] 外部终裁异常: {e}")
         jc = (judge or "").strip()
         if sup == "C" and jc and norm(jc) != norm(old) and len(jc) < 0.8 * len(old):
             # 收缩护栏：纠正把文本砍掉 20%+ → 是"转录不全"不是"改错"，拒落地
@@ -163,7 +171,7 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)["scout"]
     arbitrate(args.report, args.md, args.pdf, args.out,
-              cfg["ollama_url"], cfg["vl_model"], args.threshold)
+              cfg["ollama_url"], cfg["vl_model"], args.threshold, ext_cfg=cfg)
 
 
 if __name__ == "__main__":
