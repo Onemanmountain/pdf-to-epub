@@ -16,8 +16,12 @@ import re
 
 MARKERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 MARKER_RE = re.compile("([" + MARKERS + "])")
-# page_footnote 块通常以圈号开头："① 大意，不是确切的翻译。"
-FOOTNOTE_MARK_RE = re.compile("^\\s*([" + MARKERS + "])\\s*")
+# page_footnote 块通常以圈号开头："① 大意，不是确切的翻译。"；星号译注："* 应为 1964 年——译注。"
+FOOTNOTE_MARK_RE = re.compile("^\\s*([" + MARKERS + "*])\\s*")
+# 星号译注的正文标记：句末标点后紧跟的孤立 *（排除 ** 强调语法）。
+# 注：本书另有「字*。」标前式星标（p118/131/134/175），其 md 侧标记形态残缺，
+# 位置唯一性无法保证——宁可不配对（HTML 注释行原样保留渲染），也不错配。
+STAR_MARK_RE = re.compile(r"(?<=[。！？!?”’\"』」）)])\*(?!\*)")
 
 
 def norm(s):
@@ -36,10 +40,14 @@ def collect_page_footnotes(pages):
                 m = FOOTNOTE_MARK_RE.match(b["text"])
                 notes.append((m.group(1) if m else "", b["text"].strip()))
             elif b["type"] in ("text", "paragraph_title"):
-                t = b["text"]
+                t = re.sub(r"\$?\^\{([" + MARKERS + "*])\}\$?", r"\1", b["text"])  # $^{①}$ 上标壳剥除
                 for mm in MARKER_RE.finditer(t):
                     s = mm.start()
                     marks.append((mm.group(1), t[max(0, s - 10):s], t[s + 1:s + 11]))
+                # v0.3.2：星号译注的标记（句末标点后孤立 *）
+                for mm in STAR_MARK_RE.finditer(t):
+                    s = mm.start()
+                    marks.append(("*", t[max(0, s - 10):s], t[s + 1:s + 11]))
         if marks and notes:
             out.append((p, marks, notes))
     return out
@@ -52,28 +60,51 @@ def _flex(ctx):
 
 def normalize_footnotes(pages, md_text, report):
     """主入口。返回新 md 文本。report dict 会被填充（converted/pages_skipped/details）。
-    算法（单趟重建，无原地偏移簿记）：
-      页按序处理；每页先定位全部注释行的 (start,end) 区间，
-      输出 = 已处理前缀 + 替换过标记的正文窗口 + 定义块 + 注释区间之外的原文，
-      游标前进到最后一条注释行尾。任何一步不满足唯一性/配对性 → 整页原样保留。"""
+    v0.3.2 重写：放弃全局游标——MinerU 的 md 里页脚注释行不一定紧跟本页正文
+    （实测 p69 注释行排在 p70 正文之后），游标单调假设让后续页标记定位全灭。
+    改为每页独立配对：标记在全文范围做上下文唯一性定位，注释从最后一个标记之后
+    按行 norm 子串匹配（兼容 <small><span> HTML 包装行——行级删除天然剥掉标签）。
+    全部操作用 span 收集，最后一次重建（无偏移簿记）。
+    标记形态预处理：^{①} 上标壳剥除（MinerU 上标写法）；句末标点后的 \* 转义还原。"""
+    md_text = re.sub(r"\$?\^\{([" + MARKERS + "*])\}\$?", r"\1", md_text)
+    md_text = re.sub(r"(?<=[。！？!?”’\"』」）)])\\\*", "*", md_text)
     n_counter, converted, skipped, details = 0, 0, [], []
-    out, cursor = [], 0
+    ops = []  # (start, end, replacement)
 
     for page, marks, notes in collect_page_footnotes(pages):
         mark_chars = [m for m, _, _ in marks]
-        if len(marks) != len(notes):
-            skipped.append({"page": page, "reason": f"标记{len(marks)}个≠注释{len(notes)}条"})
+        # 最大可配对前缀：标记与注释的圈号序列从头对齐，能配几对配几对
+        # （混合页常见 ①②+* 形态：圈号照常转换，多出的译注保持原样渲染）
+        k = 0
+        while k < len(marks) and k < len(notes) and \
+                (not notes[k][0] or notes[k][0] == mark_chars[k]):
+            k += 1
+        if k == 0:
+            skipped.append({"page": page, "reason": "标记与注释序列无法对齐"})
             continue
-        if all(c for c, _ in notes) and [c for c, _ in notes] != mark_chars[:len(notes)]:
-            skipped.append({"page": page, "reason": "标记与注释圈号序列不一致"})
+        if k < len(marks) or k < len(notes):
+            details.append({"page": page, "note": f"部分配对 {k}/{max(len(marks), len(notes))}"})
+        marks, notes = marks[:k], notes[:k]
+
+        # 标记定位：全文范围上下文锚定（前后各 ~10 字，天然唯一；不依赖任何游标窗口）
+        page_ok, mark_spans = True, []
+        for mk, before, after in marks:
+            pat = _flex(before) + r"\s*(" + re.escape(mk) + r")\s*" + _flex(after)
+            hits = list(re.finditer(pat, md_text))
+            if len(hits) != 1:
+                page_ok = False
+                skipped.append({"page": page, "reason": f"标记{mk}上下文定位到{len(hits)}处（要求唯一）"})
+                break
+            mark_spans.append((hits[0].start(1), hits[0].end(1)))
+        if not page_ok:
             continue
 
-        # 从游标起依次定位各注释行（norm 匹配，行级）
-        note_spans, ok, probe = [], True, cursor
+        # 注释定位：从最后一个标记之后按行找（norm 子串）
+        probe = mark_spans[-1][1]
+        note_spans = []
         for c, ntext in notes:
             nn = norm(ntext)
-            found, found_end = -1, -1
-            pos = probe
+            found, found_end, pos = -1, -1, probe
             while pos < len(md_text):
                 idx = md_text.find("\n", pos)
                 line_end = idx if idx >= 0 else len(md_text)
@@ -84,51 +115,30 @@ def normalize_footnotes(pages, md_text, report):
                     break
                 pos = idx + 1
             if found < 0:
-                ok = False
+                page_ok = False
+                skipped.append({"page": page, "reason": "注释文本在 md 中定位失败"})
                 break
             note_spans.append((found, found_end))
             probe = found_end + 1
-        if not ok:
-            skipped.append({"page": page, "reason": "注释文本在 md 中定位失败"})
+        if not page_ok:
             continue
 
-        window = md_text[cursor:note_spans[0][0]]
-        # 上下文锚定：逐标记用「块内前后各 ~10 字」在窗口内唯一定位（与别处①枚举无关）
-        page_pairs, tmp_n, mark_spans = [], n_counter, []
-        ok = True
-        for mk, before, after in marks:
-            pat = _flex(before) + r"\s*(" + re.escape(mk) + r")\s*" + _flex(after)
-            hits = list(re.finditer(pat, window))
-            if len(hits) != 1:
-                ok = False
-                skipped.append({"page": page, "reason": f"标记{mk}上下文定位到{len(hits)}处（要求唯一）"})
-                break
-            h = hits[0]
-            mark_spans.append((h.start(1), h.end(1)))
-            tmp_n += 1
-            page_pairs.append((mk, tmp_n))
-        if not ok:
-            continue
+        # 生成操作：标记→[^n]；首条注释行→定义块，其余注释行→删除
+        base = n_counter + 1
+        for k, (st, en) in enumerate(mark_spans):
+            ops.append((st, en, f"[^{base + k}]"))
+        defs = [(base + k, FOOTNOTE_MARK_RE.sub("", nt).strip()) for k, (c, nt) in enumerate(notes)]
+        def_block = "\n\n" + "\n\n".join(f"[^{n}]: {body}" for n, body in defs) + "\n\n"
+        for k, (ns, ne) in enumerate(note_spans):
+            ops.append((ns, ne, def_block if k == 0 else ""))
+        n_counter += len(mark_spans)
+        converted += len(mark_spans)
+        details.append({"page": page, "count": len(mark_spans), "to": [n for n, _ in defs]})
 
-        # 按 span 从后往前替换标记（防位置前移）
-        for (st, en), (mk, n) in sorted(zip(mark_spans, page_pairs), reverse=True):
-            window = window[:st] + f"[^{n}]" + window[en:]
-        defs = [(n, FOOTNOTE_MARK_RE.sub("", ntext).strip()) for (mk, n), (c, ntext) in zip(page_pairs, notes)]
+    out = md_text
+    for st, en, rep in sorted(ops, key=lambda x: -x[0]):
+        out = out[:st] + rep + out[en:]
 
-        out.append(window)
-        out.append("\n\n" + "\n\n".join(f"[^{n}]: {body}" for n, body in defs) + "\n\n")
-        # 复制注释区间中除注释行以外的内容（防注释行间夹带正文被误删）
-        seg_pos, last_end = note_spans[0][0], note_spans[-1][1]
-        for st, en in note_spans:
-            out.append(md_text[seg_pos:st])
-            seg_pos = en
-        out.append(md_text[seg_pos:last_end])
-        cursor = last_end + 1
-        n_counter = tmp_n
-        converted += len(page_pairs)
-        details.append({"page": page, "count": len(page_pairs), "to": [n for _, n in page_pairs]})
-
-    out.append(md_text[cursor:])
     report["footnotes"] = {
         "converted": converted,
         "pages_skipped": skipped,
@@ -137,7 +147,7 @@ def normalize_footnotes(pages, md_text, report):
     print(f"[footnotes] 转换 {converted} 条（全书连续编号），跳过 {len(skipped)} 页（保守保持）")
     for s in skipped:
         print(f"  [skip] p{s['page']}: {s['reason']}")
-    return "".join(out)
+    return out
 
 
 def main():

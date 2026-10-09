@@ -315,6 +315,48 @@ def reconcile_headings(md_text, boundaries, pages, applied):
             s = lines[i].strip()
             if s and not s.startswith(("- ", "* ", "+ ", "#")):
                 lines[i] = "- " + s
+        # v0.3.2 问题3：目录区标题恒为一级（目录是书籍结构性独立部分；艺术书原为 ### 会归并入前言麾下）
+        ts = lines[toc_range[0]]
+        if ts.lstrip().startswith("#"):
+            tt = re.sub(r"^#+\s*", "", ts).strip()
+            lines[toc_range[0]] = "# " + tt
+        # v0.3.2 问题5b：目录条目补全边界标题——条目剥页码后以边界标题为前缀且更长 → 取全式
+        toc_entries = []
+        for i in range(toc_range[0] + 1, toc_range[1]):
+            e = re.sub(r"^[-*+]\s*", "", lines[i].strip())
+            e = re.sub(r"\s*[-—–….·]*\s*\d{1,4}\s*$", "", e).strip()  # 剥页码尾缀
+            if e:
+                toc_entries.append(e)
+        for a in applied:
+            ln_idx = a["line"]
+            if ln_idx >= len(lines) or not lines[ln_idx].lstrip().startswith("#"):
+                continue
+            cur = norm(re.sub(r"^#+\s*", "", lines[ln_idx]))
+            for e in toc_entries:
+                ne = norm(e)
+                if ne.startswith(cur) and len(ne) > len(cur) + 1:  # 前缀且显著更长
+                    lines[ln_idx] = "# " + e
+                    a["title_completed"] = e
+                    break
+    # v0.3.2 问题4：组合篇名残留块从降级改为删除——落位行后第一个非空行的 norm
+    # 是（补全后）标题 norm 的真子串 → 其内容已被组合标题完整覆盖，原书该页并无重复文字。
+    # 保护清单：非紧邻行、非子串内容一律不动（附录一内"西藏和神"等真实小标题安全）。
+    applied_lines = {a["line"]: (a.get("title_completed") or a["title"]) for a in applied}
+    for ln_idx, ttl in applied_lines.items():
+        nt = norm(ttl)
+        j = ln_idx + 1
+        while j < min(ln_idx + 6, len(lines)):  # 连续吸收：组合标题跨多块时残留是多行
+            s = lines[j].strip()
+            if not s:
+                j += 1
+                continue  # 空行跳过
+            cand = norm(re.sub(r"^#+\s*", "", s))
+            if len(cand) >= 2 and cand in nt and cand != nt:
+                demoted.append({"line": j + 1, "title": s, "reason": "组合篇名残留块删除"})
+                lines[j] = ""
+                j += 1
+                continue
+            break  # 遇到非子串行即停（保护"西藏和神"等真实小标题）
     return "\n".join(lines), demoted, keptn
 
 # ---------------- Phase 3.7 后处理（v0.3.1 修复二/五：页眉剥离 + 中文重排）----------------
@@ -341,9 +383,27 @@ _FOOTMARK = re.compile(r"^[①-⑳]")
 def _plain(s):
     return s and not s.startswith(_SPECIAL) and not _FOOTMARK.match(s)
 
-def reflow_paragraphs(md_text):
-    """中文重排：①段内视觉换行并接（CJK-CJK 无空格，含拉丁则空格）；
-    ②跨段碎段合并——前段结尾不是任何句末符号，则它是被页边界打断的同一段。
+def build_cross_page_pairs(pages, head_keys):
+    """跨页断点证据集：页 p 最后一个正文块（非页眉、非脚注/页码）原文结尾无句末标点，
+    且页 p+1 有首块 → 记 (尾块末20字norm, 首块首20字norm)。这就是"同一段话被页边界
+    截断"的充要语义证据——同页内的块间空行是 MinerU 判定的段落边界，一律不动。"""
+    body_types = ("text", "paragraph_title", "doc_title")
+    ordered = []
+    for p in sorted(pages):
+        blks = [b for b in pages[p]
+                if b["type"] in body_types and b["text"].strip()
+                and norm(b["text"]) not in head_keys]
+        if blks:
+            ordered.append((p, blks[0]["text"].strip(), blks[-1]["text"].strip()))
+    pairs = set()
+    for (p, _, last), (p2, first2, _) in zip(ordered, ordered[1:]):
+        if p2 == p + 1 and last.rstrip()[-1:] not in SENT_END:
+            pairs.add((norm(last)[-20:], norm(first2)[:20]))
+    return pairs
+
+def reflow_paragraphs(md_text, cross_pairs=frozenset()):
+    """中文重排：①段内视觉换行并接（md 语义：无空行连续行本属同段）；
+    ②跨段合并——仅当相邻两段落在跨页断点证据集中（页尾块无句末标点+页首块）。
     圈号行/标题/列表/图片/脚注定义一律不动。返回 (新md, 并接次数)。"""
     lines = md_text.split("\n")
     out, buf, joins = [], None, 0
@@ -368,18 +428,27 @@ def reflow_paragraphs(md_text):
             j = len(res) - 1
             while j >= 0 and not res[j].strip():
                 j -= 1
-            if j >= 0 and _plain(res[j].strip()) and res[j].rstrip()[-1] not in SENT_END:
-                prev = res[j].rstrip()
-                joiner = "" if _CJK(prev[-1]) and _CJK(s[0]) else " "
-                res[j] = prev + joiner + s; joins += 1
-                del res[j + 1:]
-                continue
+            if j >= 0 and _plain(res[j].strip()):
+                prev = res[j].strip()
+                # v0.3.2：跨段合并充要条件 = 跨页断点证据（不再是"前段无句末标点"单条件）
+                if (norm(prev)[-20:], norm(s)[:20]) in cross_pairs:
+                    joiner = "" if _CJK(res[j].rstrip()[-1]) and _CJK(s[0]) else " "
+                    res[j] = res[j].rstrip() + joiner + s; joins += 1
+                    del res[j + 1:]
+                    continue
         res.append(ln)
     return "\n".join(res), joins
 
+PUNCT_MAP = {",": "，", ":": "：", ";": "；", "!": "！", "?": "？"}
+
+def localize_punctuation(md_text):
+    """v0.3.2 问题2：中文语境标点本地化——两侧都是中文字符的半角 , ; : ! ? 转全角。
+    保护清单：一侧是英文或数字即不动（索引条目里的英文姓名安全）。"""
+    return re.sub(r"(?<=[一-鿿])([,;:!?])(?=[一-鿿])", lambda m: PUNCT_MAP[m.group(1)], md_text)
+
 def postprocess(md_text, pages):
     """Phase 3.7 主入口：页眉剥离（第一篇正文落位之后；独立行删、句首/句尾黏连剥）
-    → 中文重排（段内并接 + 碎段合并，自动拼回被页边界打断的词）。返回 (新md, 报告)。"""
+    → 中文重排（段内并接 + 跨页断点合并）→ 中文语境标点本地化。返回 (新md, 报告)。"""
     heads = detect_running_heads(pages)
     lines = md_text.split("\n")
     first_h = next((i for i, ln in enumerate(lines) if ln.startswith("# ")), len(lines))
@@ -407,8 +476,10 @@ def postprocess(md_text, pages):
                 lines[i] = s[:-len(hv)].strip()
                 removed.append({"line": i + 1, "text": hv, "how": "句尾黏连"})
                 break
-    md2, joins = reflow_paragraphs("\n".join(lines))
-    return md2, {"head_set": sorted(heads.values()),
+    cross_pairs = build_cross_page_pairs(pages, set(heads.keys()))
+    md2, joins = reflow_paragraphs("\n".join(lines), cross_pairs)
+    md2 = localize_punctuation(md2)
+    return md2, {"head_set": sorted(heads.values()), "cross_page_pairs": len(cross_pairs),
                  "heads_removed": removed, "reflow_joins": joins}
 
 def main():
