@@ -386,12 +386,15 @@ def postprocess(md_text, pages):
     removed = []
     for i in range(first_h + 1, len(lines)):
         s = lines[i].strip()
-        if not _plain(s):
+        if not s or s.startswith(("#", "[^", "!")):
             continue
-        ns = norm(s)
+        s2 = re.sub(r"^[-*+]\s+", "", s)  # 列表前缀不妨碍整行页眉判定（目录区统一列表化会把页眉行变成列表项）
+        ns = norm(s2)
         if ns in heads:
             removed.append({"line": i + 1, "text": s, "how": "独立行"})
             lines[i] = ""
+            continue
+        if not _plain(s):
             continue
         for hk, hv in heads.items():
             if len(ns) <= len(hk) + 4:

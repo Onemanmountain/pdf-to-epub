@@ -115,8 +115,9 @@ def arbitrate(report_path, md_path, pdf_path, out_path, ollama_url, vl_model, th
             j = {"supports": "none", "reason": f"error {e}"}
         sup = j.get("supports", "none")
         tier = "本地整页"
-        # 本地无法裁定（none/冲突/异常/并列）→ 外部强视觉终裁（150dpi 控制载荷）
-        if sup not in ("A", "B", "C") and ext_on:
+        # 本地无法裁定（none/冲突/并列）或模板回声（reason 一字不差复述占位符）→ 外部强视觉终裁
+        junk = j.get("reason", "").strip() in ("一句话", "", "…", "...")
+        if (sup not in ("A", "B", "C") or junk) and ext_on:
             try:
                 png150 = os.path.join(tmp, f"p{page}_150.png")
                 doc[page - 1].get_pixmap(dpi=150).save(png150)

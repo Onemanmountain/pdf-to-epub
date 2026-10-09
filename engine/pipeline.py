@@ -132,7 +132,8 @@ def run(pdf, title, author, outdir, mode, config_path=None, skip_scout=False, no
     verify_report_p = os.path.join(extracted, "verify_report.json")
     print("[Phase 3] 三级校验（启发式 → 裁判 → VLM 复核）...")
     sh([venv_py, verify_py, "--md", structured_md, "--pdf", pdf, "--mid", extracted,
-        "--out", verified_md, "--report", verify_report_p, "--backend", "ollama", "--title", title])
+        "--out", verified_md, "--report", verify_report_p, "--backend", "ollama", "--title", title,
+        "--max-flags", "100"])  # 检测器变多后 30 上限会把真实报警截掉（v0.3.1 实测：漫长 124 条 flags）
     vrep = json.load(open(verify_report_p, encoding="utf-8"))
     report["phases"]["verify"] = {"flags": len(vrep.get("flags", [])),
                                   "applied": len(vrep.get("applied", [])),

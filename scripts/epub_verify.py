@@ -110,7 +110,7 @@ def flag_blocks(blocks):
         detail = ""
         if b["type"] in ("text", "interline_equation") and len(t) <= 2 and not re.fullmatch(r"[0-9一二三四五六七八九十]+[.、]?|[*\-—·]", t):
             kind, detail = "isolated_short", f"孤立短块({len(t)}字)"
-        elif re.search(r"[\u4e00-\u9fff]\d[\u4e00-\u9fff]", t):
+        elif re.search(r"[一-鿿]\d[一-鿿]", t):
             kind, detail = "digit_in_word", "数字混入词中"
         elif b["type"] in ("paragraph_title", "doc_title") and re.search(r"\s[0-9IilLoO]{1,4}$", t):
             kind, detail = "heading_pagenum", "标题带页码尾缀"
@@ -127,7 +127,32 @@ def flag_blocks(blocks):
                 kind, detail = "unbalanced_pair", f"成对符号不配: {','.join(bad)}"
         if kind:
             flags.append({**b, "idx": i, "kind": kind, "detail": detail})
+    # v0.3.1 修复四（二层）：页首块以开引号“开头 **且上一页结尾无句末标点** → 疑似幻影引号。
+    # 证据逻辑：新开引号意味着新段落，而上一页在句中断裂（无句末标点）说明同段延续，
+    # 两者矛盾，必有一错——合法的长引文续段（每段以“开头）上一页必然完整收句，不受影响。
+    # （MinerU 在续页首块 phantom 插入开引号，块内平衡使页内配对检查漏网——实测。）
+    from collections import defaultdict
+    page_first_text, page_last_text = {}, {}
+    for b in blocks:
+        if b["type"] != "text" or not b["text"].strip():
+            continue
+        page_first_text.setdefault(b["page"], b["text"].strip())
+        page_last_text[b["page"]] = b["text"].strip()
+    SENT_END_CHARS = "。！？!?”』」：:;；"
+    for pg in sorted(page_first_text):
+        ft = page_first_text[pg]
+        if not ft.startswith("“"):
+            continue
+        prev = page_last_text.get(pg - 1, "")
+        if prev and prev[-1] not in SENT_END_CHARS:
+            i = next(idx for idx, b in enumerate(blocks) if b["page"] == pg and b["text"].strip() == ft)
+            flags.append({**blocks[i], "idx": i, "kind": "page_open_quote",
+                          "detail": "页首开引号且上页句中断（疑似幻影引号，须看页首）"})
+    flags.sort(key=lambda f: (f["page"], f["idx"]))  # 后追加的检测类不得排在队尾被上限截掉
     return flags
+
+# 配对/页首引号类报警：比较器必须保留引号（检测器盯的字符即信号本身）
+QUOTE_PRESERVE_KINDS = {"unbalanced_pair", "page_open_quote"}
 
 RARE_SET = set("否登涉粱汾渭浚芮晁扈戛轼鹑骅羁囡殇烨骞虢澹踵隼蹙鲸嚼淼焱垚骉猋")
 
@@ -225,7 +250,8 @@ def ollama_chat(url, model, prompt, images_b64=None, think=None, timeout=900):
     if images_b64:
         msg["images"] = images_b64
     payload = {"model": model, "messages": [msg],
-               "stream": False, "keep_alive": "30m"}
+               "stream": False, "keep_alive": "30m",
+               "options": {"num_ctx": 16384}}  # 大裁块+长文段超默认 4096 会被 400 拒（实战：p17 大块视觉证据 400 缺失）
     if think is not None:
         payload["think"] = think
     req = urllib.request.Request(url + "/api/chat",
@@ -348,6 +374,10 @@ def main():
             except Exception as e:
                 truth = f"<error {e}>"
             norm = lambda s: re.sub(r"[\s，。,.、·:：;；\"'“”‘’《》<>!\[\]【】]", "", s)
+            # v0.3.1 修复四配套：配对符号类报警的比较器不能剥离引号——检测器盯的字符恰是信号本身
+            # （norm 剥掉引号 → 仅修引号的提案被判"无差异"结案 → 故障三轮不漏，实测教训）
+            if f["kind"] in QUOTE_PRESERVE_KINDS:
+                norm = lambda s: re.sub(r"[\s，。,.、·:：;；\"'<>!\[\]【】]", "", s)
             # v0.3.1 修复一：写回前对齐修剪（剥除模型带出的邻段头尾）+ 繁体污染护栏
             truth, stripped = trim_to_span(f["text"], truth)
             if stripped:
